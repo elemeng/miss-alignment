@@ -4,13 +4,11 @@ import socket
 import warnings
 from pathlib import Path
 from shutil import copyfile
-from typing import Optional
-import yaml
 
-import typer
 import torch
 import torch.multiprocessing as torch_mp
-
+import typer
+import yaml
 from lightning.pytorch import Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
@@ -18,14 +16,14 @@ from lightning.pytorch.plugins.environments import LightningEnvironment
 from lightning.pytorch.strategies import DDPStrategy
 
 from ._cli import OPTION_PROMPT_KWARGS, cli
-from .utils import configure_logging, parse_device_list, sync_start_iteration_xmls
+from .alignment import run_alignment_parallel
 from .data import MissAlignmentDataModule
 from .data.io import exclude_nonfinite_alignment_tilt_series
 from .data.shift_generation import create_default_generator
-from .models import MissAlignment, MAEarlyStopping, MAProgressBar
-from .alignment import run_alignment_parallel
+from .models import MAEarlyStopping, MAProgressBar, MissAlignment
 from .prepare_stacks import prepare_stacks_parallel
 from .preprocessing import run_cross_correlation_alignment_parallel
+from .utils import configure_logging, parse_device_list, sync_start_iteration_xmls
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +71,8 @@ def _set_ddp_env(rank: int, world_size: int, master_port: int) -> None:
 def _resolve_start_checkpoint(
     start_iter: int,
     training_directory: Path,
-    config_checkpoint: Optional[str],
-) -> Optional[Path]:
+    config_checkpoint: str | None,
+) -> Path | None:
     """Pick the checkpoint to start the first training iteration from.
 
     iter 0 uses the config's ``model_checkpoint`` (or None for random weights).
@@ -111,7 +109,7 @@ def _training_worker(
     world_size: int,
     master_port: int,
     iteration: int,
-    model_checkpoint: Optional[Path],
+    model_checkpoint: Path | None,
     training_directory: Path,
     devices_training: list[int],
     devices_reconstruction: list[int],
@@ -300,18 +298,25 @@ def train_miss_align(
         0,
         help="Continue from a specific iteration in the config.",
     ),
-    prepare_stacks: Optional[float] = typer.Option(
+    prepare_stacks: float | None = typer.Option(
         None,
         help="Pixel size (in Angstroms) for preprocessing tilt stacks. "
         "If provided, loads raw tilt images, rescales to this pixel size, "
         "and creates tilt stacks with thumbnails before training.",
+    ),
+    reuse_prepared_stacks: bool = typer.Option(
+        False,
+        help="Reuse existing tilt stacks that already match the requested "
+        "pixel size (checked via the stack's MRC header) instead of "
+        "re-preparing them from raw movies. Only effective together with "
+        "--prepare-stacks.",
     ),
     preprocess: bool = typer.Option(
         False,
         help="Run cross-correlation based alignment before training iterations. "
         "This performs coarse alignment.",
     ),
-    n_cluster_workers: Optional[int] = typer.Option(
+    n_cluster_workers: int | None = typer.Option(
         None,
         help="Number of cluster jobs to submit for the alignment phase. "
         "When set, activates cluster mode; requires MISS_CLUSTER_CONFIG "
@@ -396,6 +401,7 @@ def train_miss_align(
             desired_pixel_size=prepare_stacks,
             devices=devices_alignment,
             n_cluster_workers=n_cluster_workers,
+            reuse_prepared_stacks=reuse_prepared_stacks,
         )
 
     # Run preprocessing if requested
@@ -519,4 +525,3 @@ def train_miss_align(
         # training_model_path now points at the model just trained
         # (set after the worker above); the next iteration starts from it.
 
-    return None
