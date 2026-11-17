@@ -69,6 +69,7 @@ class TiltSeriesFetcher:
         tilt_series, images, pixel_size = tilt_series_data.load_metadata_and_stack(
             downsample=self.downsample,
             retry_on_read_error=True,
+            device=self.device,  # rescale + preprocessing run on the worker GPU
         )
         # run the preprocessing from warp for consistency
         images = preprocess_tilt_data(
@@ -242,7 +243,7 @@ def reconstruction_worker(
                 delete=False,
             ) as tmp_file:
                 tmp_path = Path(tmp_file.name)
-                pickle.dump(triplet_fp16, tmp_file)
+                pickle.dump(triplet_fp16, tmp_file, protocol=pickle.HIGHEST_PROTOCOL)
 
             os.chmod(tmp_path, 0o644)
             tmp_path.rename(file_path)

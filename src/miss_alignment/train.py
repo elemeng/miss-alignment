@@ -17,7 +17,7 @@ from lightning.pytorch.strategies import DDPStrategy
 
 from ._cli import OPTION_PROMPT_KWARGS, cli
 from .alignment import run_alignment_parallel
-from .data import MissAlignmentDataModule
+from .data import DEFAULT_POOL_SIZE, MissAlignmentDataModule
 from .data.io import exclude_nonfinite_alignment_tilt_series
 from .data.shift_generation import create_default_generator
 from .models import MAEarlyStopping, MAProgressBar, MissAlignment
@@ -38,6 +38,25 @@ def _available_cpus() -> int:
     if hasattr(os, "sched_getaffinity"):
         return len(os.sched_getaffinity(0))
     return os.cpu_count() or 1
+
+
+def _resolve_pool_size(pool_size: int | None) -> int:
+    """Resolve the reconstruction pool size.
+
+    An explicit CLI value wins; otherwise the ``RECON_POOL_SIZE`` environment
+    variable is honored, falling back to the module default (1000).
+    """
+    if pool_size is not None:
+        return pool_size
+    env_value = os.environ.get("RECON_POOL_SIZE")
+    if env_value is not None:
+        resolved = int(env_value)
+        if resolved <= 0:
+            raise ValueError(
+                f"RECON_POOL_SIZE must be a positive integer, got {env_value!r}"
+            )
+        return resolved
+    return DEFAULT_POOL_SIZE
 
 
 def _find_free_port() -> int:
@@ -288,11 +307,12 @@ def train_miss_align(
         help="Number of CPU DataLoader workers per training device. "
         "Total DataLoader workers = this value × number of training devices.",
     ),
-    pool_size: int = typer.Option(
-        1000,
+    pool_size: int | None = typer.Option(
+        None,
         help="Maximum number of subtomgram reconstructions "
         "to write to temporary storage during training of the "
-        "misalignment model.",
+        "misalignment model. Defaults to the RECON_POOL_SIZE environment "
+        "variable, or 1000 if unset.",
     ),
     start_at_iteration: int = typer.Option(
         0,
@@ -314,7 +334,9 @@ def train_miss_align(
     preprocess: bool = typer.Option(
         False,
         help="Run cross-correlation based alignment before training iterations. "
-        "This performs coarse alignment.",
+        "This performs coarse alignment. Note: it loads each full-resolution "
+        "tilt stack onto the GPU, so the device needs enough memory for the "
+        "largest stack.",
     ),
     n_cluster_workers: int | None = typer.Option(
         None,
@@ -442,6 +464,9 @@ def train_miss_align(
     # working alignments from that iteration's snapshot.
     sync_start_iteration_xmls(start_iter, training_directory)
 
+    # Resolve the reconstruction pool size once (CLI value > env var > default)
+    resolved_pool_size = _resolve_pool_size(pool_size)
+
     for x in range(start_iter, end_iter):
         # ============================================================
         # ================= model training step ======================
@@ -471,7 +496,7 @@ def train_miss_align(
             shift_generation_config,
             iteration_settings,
             dataloaders_per_trainer,
-            pool_size,
+            resolved_pool_size,
         )
         if world_size > 1:
             torch_mp.spawn(
@@ -524,4 +549,3 @@ def train_miss_align(
 
         # training_model_path now points at the model just trained
         # (set after the worker above); the next iteration starts from it.
-

@@ -137,7 +137,15 @@ class ReconstructionPoolDataset(Dataset):
         return *volumes, labels
 
     def _prep_and_augment(self, volumes: list[torch.Tensor]) -> list[torch.Tensor]:
-        volumes = [self._normalize(v) for v in volumes]
+        # Stack the triplet into one tensor so normalization runs as a single
+        # batched reduction. The augmentation calls stay per-volume so their
+        # RNG draw order is identical to the per-volume version.
+        stacked = torch.stack(volumes)
+        mean = torch.mean(stacked, dim=(-3, -2, -1), keepdim=True)
+        std = torch.std(stacked, dim=(-3, -2, -1), keepdim=True)
+        stacked = (stacked - mean) / std.clamp(min=1e-6)
+
+        volumes = list(torch.unbind(stacked))
         volumes = [random_contrast(v) for v in volumes]
         volumes = [random_edge_mask(v, edge_width=(1, 5)) for v in volumes]
         volumes = [random_cube_mask(v) for v in volumes]

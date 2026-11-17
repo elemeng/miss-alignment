@@ -142,6 +142,56 @@ class TestTiltSeriesData:
         with pytest.raises(FileNotFoundError, match="does_not_exist.xml"):
             data.load_metadata_and_stack()
 
+    def test_load_metadata_and_stack_device_passthrough(self, tmp_path):
+        """device='cpu' leaves values identical and the stack on that device."""
+        xml_path = tmp_path / "test.xml"
+
+        n_tilts = 10
+        tilt_series = TiltSeries(path=xml_path, n_tilts=n_tilts)
+        tilt_series.angles = torch.linspace(-60, 60, n_tilts)
+        tilt_series.size_rounding_factors = torch.tensor([1, 1, 1])
+        tilt_series.image_dimensions_physical = torch.tensor([1000.0, 1000.0])
+        tilt_series.volume_dimensions_physical = torch.tensor([1000.0, 1000.0, 1000.0])
+        tilt_series.save_meta(xml_path)
+
+        Path(tilt_series.tilt_stack_path).parent.mkdir(parents=True, exist_ok=True)
+
+        images = torch.randn(n_tilts, 100, 100)
+        with mrcfile.new(tilt_series.tilt_stack_path, overwrite=True) as mrc:
+            mrc.set_data(images.numpy())
+            mrc.voxel_size = 10.0
+
+        data = TiltSeriesData(xml_metadata_path=xml_path)
+
+        _, no_device, _ = data.load_metadata_and_stack(downsample=2)
+        _, with_device, pixel_size = data.load_metadata_and_stack(
+            downsample=2, device="cpu"
+        )
+
+        assert with_device.device.type == "cpu"
+        assert pixel_size == 20.0
+        # identical values with and without the device passthrough
+        torch.testing.assert_close(no_device, with_device)
+
+    def test_read_stack_returns_writable_tensor(self, tmp_path):
+        """The zero-copy stack read yields a writable tensor with matching values."""
+        from miss_alignment.data.io import _read_stack
+
+        stack_path = tmp_path / "stack.mrc"
+        images = torch.randn(4, 16, 16)
+        with mrcfile.new(stack_path, overwrite=True) as mrc:
+            mrc.set_data(images.numpy())
+            mrc.voxel_size = 5.0
+
+        loaded, pixel_size = _read_stack(stack_path)
+
+        assert pixel_size == 5.0
+        assert loaded.dtype == torch.float32
+        torch.testing.assert_close(loaded, images)
+        # in-place modification must be safe (e.g. downstream augmentation)
+        loaded += 1.0
+        torch.testing.assert_close(loaded, images + 1.0)
+
 
 class TestRetryOnReadError:
     """Tests for the retry_on_read_error flag in load_metadata_and_stack."""
