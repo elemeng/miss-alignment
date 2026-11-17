@@ -129,6 +129,10 @@ def evaluate_tilt_series(
     initial_reliable_fraction: float = 1 / 2,
     n_control_points: int = 7,
     model: MissAlignment | None = None,
+    oversampling: float = 2.0,
+    optimizer: str = "lbfgs",
+    optimizer_kwargs: dict | None = None,
+    position_subsample_fraction: float = 1.0,
 ) -> tuple[Path, list[float]]:
     """Evaluate and optimize tilt series alignment using trained model.
 
@@ -163,6 +167,16 @@ def evaluate_tilt_series(
         Initial reliable fraction for "anchoring" setting.
     n_control_points : int
         Number of spline control points for "spline" setting.
+    oversampling : float, default 2.0
+        Reconstruction oversampling factor; lower values (e.g. 1.0) trade
+        accuracy for speed in the reconstruction step.
+    optimizer : str, default "lbfgs"
+        Gradient optimizer for the alignment parameters ("lbfgs" or "adam").
+    optimizer_kwargs : dict | None
+        Extra optimizer settings; for "adam" typically {"n_steps": .., "lr": ..}.
+    position_subsample_fraction : float, default 1.0
+        Fraction of positions evaluated in early anchoring passes (anchoring
+        setting only); final passes always use all positions.
 
     Returns
     -------
@@ -222,6 +236,10 @@ def evaluate_tilt_series(
             apply_ctf=apply_ctf,
             device=device,
             initial_reliable_fraction=initial_reliable_fraction,
+            position_subsample_fraction=position_subsample_fraction,
+            oversampling=oversampling,
+            optimizer=optimizer,
+            optimizer_kwargs=optimizer_kwargs,
         )
     elif setting == "spline":
         # Coarse-to-fine: smooth spline followed by per-tilt adjustment
@@ -236,6 +254,9 @@ def evaluate_tilt_series(
             apply_ctf=apply_ctf,
             device=device,
             n_control_points=n_control_points,
+            oversampling=oversampling,
+            optimizer=optimizer,
+            optimizer_kwargs=optimizer_kwargs,
         )
     else:
         # "global" or tuple settings for 2D/3D warping
@@ -250,6 +271,9 @@ def evaluate_tilt_series(
             batch_size=batch_size,
             apply_ctf=apply_ctf,
             device=device,
+            oversampling=oversampling,
+            optimizer=optimizer,
+            optimizer_kwargs=optimizer_kwargs,
         )
 
     # write all necessary output

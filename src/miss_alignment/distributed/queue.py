@@ -84,6 +84,11 @@ class TaskSpec:
     task_type: str = "alignment"
     desired_pixel_size: float | None = None
     lowpass_cutoff: float | None = None
+    # Alignment performance knobs (see evaluate_tilt_series).
+    oversampling: float | None = None
+    optimizer: str | None = None
+    optimizer_kwargs: dict | None = None
+    position_subsample_fraction: float | None = None
 
 
 def _atomic_write(path: Path, data: dict) -> None:

@@ -147,6 +147,10 @@ def run_distributed(
     task_type: str = "alignment",
     desired_pixel_size: float | None = None,
     lowpass_cutoff: float | None = None,
+    oversampling: float | None = None,
+    optimizer: str | None = None,
+    optimizer_kwargs: dict | None = None,
+    position_subsample_fraction: float | None = None,
 ) -> dict[str, float]:
     """Write tasks, provision workers, block until all tasks are terminal.
 
@@ -197,6 +201,10 @@ def run_distributed(
             task_type=task_type,
             desired_pixel_size=desired_pixel_size,
             lowpass_cutoff=lowpass_cutoff,
+            oversampling=oversampling,
+            optimizer=optimizer,
+            optimizer_kwargs=optimizer_kwargs,
+            position_subsample_fraction=position_subsample_fraction,
         )
         write_pending(layout, spec)
 
