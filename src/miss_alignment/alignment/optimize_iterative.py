@@ -70,39 +70,35 @@ def run_iterative_anchoring(
         pos_boundary_sorted_idx = n_tilts - 1 - n_unreliable_per_side
 
         # Store relative offsets for unreliable tilts (chain-like, toward center)
-        # Negative side: sorted indices 0 to neg_boundary_sorted_idx-1
-        neg_relative_offsets_x = []
-        neg_relative_offsets_y = []
-        for i in range(n_unreliable_per_side):
-            curr_tilt_idx = sorted_indices[i]
-            next_tilt_idx = sorted_indices[i + 1]  # neighbor toward center
-            rel_x = (
-                tilt_series.tilt_axis_offset_x[curr_tilt_idx]
-                - tilt_series.tilt_axis_offset_x[next_tilt_idx]
-            ).clone()
-            rel_y = (
-                tilt_series.tilt_axis_offset_y[curr_tilt_idx]
-                - tilt_series.tilt_axis_offset_y[next_tilt_idx]
-            ).clone()
-            neg_relative_offsets_x.append(rel_x)
-            neg_relative_offsets_y.append(rel_y)
+        # gathered in one shot: for each unreliable tilt (sorted-index space),
+        # rel = offset[curr] - offset[neighbor toward center].
+        # Negative side: sorted indices [0, n_unreliable_per_side), each
+        # subtracting the neighbor at i+1; boundary is the first reliable tilt.
+        n = n_unreliable_per_side
+        neg_sorted = sorted_indices[:n]
+        neg_neighbors = sorted_indices[1 : n + 1]
+        neg_relative_offsets_x = (
+            tilt_series.tilt_axis_offset_x[neg_sorted]
+            - tilt_series.tilt_axis_offset_x[neg_neighbors]
+        )
+        neg_relative_offsets_y = (
+            tilt_series.tilt_axis_offset_y[neg_sorted]
+            - tilt_series.tilt_axis_offset_y[neg_neighbors]
+        )
 
-        # Positive side: sorted indices pos_boundary_sorted_idx+1 to n_tilts-1
-        pos_relative_offsets_x = []
-        pos_relative_offsets_y = []
-        for i in range(pos_boundary_sorted_idx + 1, n_tilts):
-            curr_tilt_idx = sorted_indices[i]
-            prev_tilt_idx = sorted_indices[i - 1]  # neighbor toward center
-            rel_x = (
-                tilt_series.tilt_axis_offset_x[curr_tilt_idx]
-                - tilt_series.tilt_axis_offset_x[prev_tilt_idx]
-            ).clone()
-            rel_y = (
-                tilt_series.tilt_axis_offset_y[curr_tilt_idx]
-                - tilt_series.tilt_axis_offset_y[prev_tilt_idx]
-            ).clone()
-            pos_relative_offsets_x.append(rel_x)
-            pos_relative_offsets_y.append(rel_y)
+        # Positive side: sorted indices (pos_boundary_sorted_idx, n_tilts),
+        # each subtracting the neighbor at i-1; boundary is the last reliable
+        # tilt (sorted_indices[pos_boundary_sorted_idx]).
+        pos_sorted = sorted_indices[pos_boundary_sorted_idx + 1 :]
+        pos_neighbors = sorted_indices[pos_boundary_sorted_idx : n_tilts - 1]
+        pos_relative_offsets_x = (
+            tilt_series.tilt_axis_offset_x[pos_sorted]
+            - tilt_series.tilt_axis_offset_x[pos_neighbors]
+        )
+        pos_relative_offsets_y = (
+            tilt_series.tilt_axis_offset_y[pos_sorted]
+            - tilt_series.tilt_axis_offset_y[pos_neighbors]
+        )
 
         # Run optimization
         tilt_series, loss_values = optimize_fn(tilt_series)
@@ -131,32 +127,38 @@ def run_iterative_anchoring(
 
         # ALWAYS apply anchoring restoration to ensure unreliable tilts
         # maintain their structure relative to the current iteration's reliable set
-        # Restore unreliable tilts with chain-like relative offsets
-        # Negative side: propagate from boundary outward (high sorted idx to low)
-        for i in range(n_unreliable_per_side - 1, -1, -1):
-            curr_tilt_idx = sorted_indices[i]
-            next_tilt_idx = sorted_indices[i + 1]
-            tilt_series.tilt_axis_offset_x[curr_tilt_idx] = (
-                tilt_series.tilt_axis_offset_x[next_tilt_idx]
-                + neg_relative_offsets_x[i]
+        # Restore unreliable tilts with chain-like relative offsets. Propagation
+        # is sequential (each tilt depends on its restored neighbor), computed
+        # with cumulative offsets from the boundary outward.
+        # Negative side: boundary (first reliable tilt, sorted index
+        # n_unreliable_per_side) holds the restored reference; moving outward
+        # from it, tilt i (sorted idx n-1-i... i.e. the i-th from the boundary)
+        # gets boundary + sum(rel for tilts between it and the boundary).
+        # rel[i] = offset[sorted[i]] - offset[sorted[i+1]] with sorted[0] the
+        # outermost tilt, so cumsum from the end gives outward propagation.
+        if n > 0:
+            boundary_x = tilt_series.tilt_axis_offset_x[sorted_indices[n]]
+            boundary_y = tilt_series.tilt_axis_offset_y[sorted_indices[n]]
+            # out_cum[i] = sum of rel[i:] = offset[sorted[i]] - offset[boundary]
+            out_cum_x = torch.flip(
+                torch.cumsum(torch.flip(neg_relative_offsets_x, [0]), 0), [0]
             )
-            tilt_series.tilt_axis_offset_y[curr_tilt_idx] = (
-                tilt_series.tilt_axis_offset_y[next_tilt_idx]
-                + neg_relative_offsets_y[i]
+            out_cum_y = torch.flip(
+                torch.cumsum(torch.flip(neg_relative_offsets_y, [0]), 0), [0]
             )
+            tilt_series.tilt_axis_offset_x[neg_sorted] = boundary_x + out_cum_x
+            tilt_series.tilt_axis_offset_y[neg_sorted] = boundary_y + out_cum_y
 
-        # Positive side: propagate from boundary outward (low sorted idx to high)
-        for i, sorted_i in enumerate(range(pos_boundary_sorted_idx + 1, n_tilts)):
-            curr_tilt_idx = sorted_indices[sorted_i]
-            prev_tilt_idx = sorted_indices[sorted_i - 1]
-            tilt_series.tilt_axis_offset_x[curr_tilt_idx] = (
-                tilt_series.tilt_axis_offset_x[prev_tilt_idx]
-                + pos_relative_offsets_x[i]
-            )
-            tilt_series.tilt_axis_offset_y[curr_tilt_idx] = (
-                tilt_series.tilt_axis_offset_y[prev_tilt_idx]
-                + pos_relative_offsets_y[i]
-            )
+        # Positive side: boundary (last reliable tilt, sorted idx
+        # pos_boundary_sorted_idx); tilt i gets boundary + sum(rel[:i+1]).
+        if len(pos_relative_offsets_x) > 0:
+            boundary_sorted_idx = sorted_indices[pos_boundary_sorted_idx]
+            boundary_x = tilt_series.tilt_axis_offset_x[boundary_sorted_idx]
+            boundary_y = tilt_series.tilt_axis_offset_y[boundary_sorted_idx]
+            in_cum_x = torch.cumsum(pos_relative_offsets_x, dim=0)
+            in_cum_y = torch.cumsum(pos_relative_offsets_y, dim=0)
+            tilt_series.tilt_axis_offset_x[pos_sorted] = boundary_x + in_cum_x
+            tilt_series.tilt_axis_offset_y[pos_sorted] = boundary_y + in_cum_y
 
         # Expand reliable set by 1 tilt per side
         n_unreliable_per_side -= 1
@@ -226,6 +228,12 @@ def optimize_shifts_iterative(
     tuple[TiltSeries, list[float]]
         Optimized tilt series and loss values from all iterations.
     """
+    # Keep model, tilt series, and images resident on device for the whole
+    # anchoring run: every pass would otherwise pay device transfers both ways
+    # (~20 passes per series). The closure below inherits the caller's device.
+    device = torch.device(device)
+    tilt_series.to(device)
+    model.to(device)
 
     def optimize_fn(ts: TiltSeries) -> tuple[TiltSeries, list[float]]:
         return optimize_shifts(
@@ -239,10 +247,16 @@ def optimize_shifts_iterative(
             batch_size=batch_size,
             apply_ctf=apply_ctf,
             device=device,
+            device_override=device,
         )
 
-    return run_iterative_anchoring(
-        tilt_series=tilt_series,
-        optimize_fn=optimize_fn,
-        initial_reliable_fraction=initial_reliable_fraction,
-    )
+    try:
+        return run_iterative_anchoring(
+            tilt_series=tilt_series,
+            optimize_fn=optimize_fn,
+            initial_reliable_fraction=initial_reliable_fraction,
+        )
+    finally:
+        # Caller of evaluate_tilt_series expects CPU-resident metadata.
+        tilt_series.to("cpu")
+        model.to("cpu")

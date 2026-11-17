@@ -408,22 +408,25 @@ class TestCountPartitionFiles:
         """Test counting files in a partition.
 
         Files are named: partition_{partition_id}_worker_{worker_id}_seq_{seq_id}.pickle
+        and live in the per-partition subdirectory pool_dir/partition_{id}/.
         Multiple workers can write to the same partition.
         """
         # Create some partition files from worker 0
+        (temp_dir / "partition_0").mkdir(parents=True, exist_ok=True)
         for i in range(3):
-            (temp_dir / f"partition_0_worker_0_seq_{i}.pickle").touch()
+            (temp_dir / "partition_0" / f"partition_0_worker_0_seq_{i}.pickle").touch()
 
         # Create some partition files from worker 1 (same partition)
         for i in range(2):
-            (temp_dir / f"partition_0_worker_1_seq_{i}.pickle").touch()
+            (temp_dir / "partition_0" / f"partition_0_worker_1_seq_{i}.pickle").touch()
 
         # Create files for another partition
+        (temp_dir / "partition_1").mkdir(parents=True, exist_ok=True)
         for i in range(3):
-            (temp_dir / f"partition_1_worker_0_seq_{i}.pickle").touch()
+            (temp_dir / "partition_1" / f"partition_1_worker_0_seq_{i}.pickle").touch()
 
         # Create a temp file (starts with tmp_ so won't match pattern)
-        (temp_dir / "tmp_partition_0_worker_0_xyz.pickle").touch()
+        (temp_dir / "partition_0" / "tmp_partition_0_worker_0_xyz.pickle").touch()
 
         # Partition 0 should have 5 files (3 from worker 0 + 2 from worker 1)
         assert _count_partition_files(temp_dir, 0) == 5
@@ -559,7 +562,9 @@ class TestReconstructionWorker:
 
         # Check that files were created with correct naming
         # (distributed across partitions)
-        files = list(temp_dir.glob(f"partition_*_worker_{worker_id}_seq_*.pickle"))
+        files = list(
+            temp_dir.glob(f"partition_*/partition_*_worker_{worker_id}_seq_*.pickle")
+        )
         assert len(files) == 8  # 2 calls × 4 triplets
 
         # Verify file contents
@@ -582,8 +587,13 @@ class TestReconstructionWorker:
 
         # Pre-fill all partitions
         for partition_id in range(n_partitions):
+            (temp_dir / f"partition_{partition_id}").mkdir(parents=True, exist_ok=True)
             for i in range(partition_size):
-                (temp_dir / f"partition_{partition_id}_worker_0_seq_{i}.pickle").touch()
+                (
+                    temp_dir
+                    / f"partition_{partition_id}"
+                    / f"partition_{partition_id}_worker_0_seq_{i}.pickle"
+                ).touch()
 
         # Create mock returns
         mock_tilt_series = Mock(spec=TiltSeries)
@@ -662,8 +672,10 @@ class TestReconstructionWorker:
 
         # Pre-fill partitions 1-3 to their limit; only partition 0 has space
         for p in [1, 2, 3]:
+            partition_dir = temp_dir / f"partition_{p}"
+            partition_dir.mkdir(parents=True, exist_ok=True)
             for seq in range(partition_size):
-                (temp_dir / f"partition_{p}_worker_99_seq_{seq}.pickle").touch()
+                (partition_dir / f"partition_{p}_worker_99_seq_{seq}.pickle").touch()
 
         mock_tilt_series = Mock(spec=TiltSeries)
         mock_tilt_series.angles = torch.linspace(-60, 60, 10)
@@ -765,7 +777,9 @@ class TestReconstructionWorker:
             )
 
         # Check sequential IDs (files are distributed across partitions)
-        files = sorted(temp_dir.glob(f"partition_*_worker_{worker_id}_seq_*.pickle"))
+        files = sorted(
+            temp_dir.glob(f"partition_*/partition_*_worker_{worker_id}_seq_*.pickle")
+        )
         assert len(files) == 12  # 3 calls × 4 triplets
 
         # Extract IDs and verify they're sequential

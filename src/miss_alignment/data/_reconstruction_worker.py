@@ -94,6 +94,16 @@ class TiltSeriesFetcher:
         return self._tilt_series, self._images, self._pixel_size
 
 
+def _partition_dir(pool_dir: Path, partition_id: int) -> Path:
+    """Return the subdirectory holding files for one partition.
+
+    Files live in pool_dir/partition_{id}/ to keep per-partition listing
+    (used on every write and read) proportional to that partition's size
+    instead of the whole pool.
+    """
+    return pool_dir / f"partition_{partition_id}"
+
+
 def _count_partition_files(pool_dir: Path, partition_id: int) -> int:
     """Count the number of files in a partition.
 
@@ -101,7 +111,7 @@ def _count_partition_files(pool_dir: Path, partition_id: int) -> int:
     All workers write to all partitions, so we count files from all workers.
     """
     pattern = f"partition_{partition_id}_worker_*_seq_*.pickle"
-    return len(list(pool_dir.glob(pattern)))
+    return len(list(_partition_dir(pool_dir, partition_id).glob(pattern)))
 
 
 def reconstruction_worker(
@@ -216,15 +226,17 @@ def reconstruction_worker(
             # Convert to fp16 for storage
             triplet_fp16 = [(vol.half(), label) for vol, label in triplet]
 
-            # Write with atomic rename
+            # Write with atomic rename into the partition subdirectory
             # File name includes worker_id for uniqueness across workers
+            partition_dir = _partition_dir(pool_dir, current_partition)
+            partition_dir.mkdir(parents=True, exist_ok=True)
             filename = (
                 f"partition_{current_partition}_worker_{worker_id}"
                 f"_seq_{sequential_id}.pickle"
             )
-            file_path = pool_dir / filename
+            file_path = partition_dir / filename
             with tempfile.NamedTemporaryFile(
-                dir=pool_dir,
+                dir=partition_dir,
                 prefix=f"tmp_partition_{current_partition}_worker_{worker_id}_",
                 suffix=".pickle",
                 delete=False,
@@ -375,6 +387,13 @@ def _create_pool_reconstruction(
         anchor_base = misaligned.clone()
         anchor_label = -1
 
+    # Move the 4 unique volumes to CPU in a single transfer (pinned batch),
+    # then apply mirroring on CPU. This replaces 24 individual D2H copies
+    # with one batched copy; 96^3 flips are negligible on CPU.
+    cpu_aligned = aligned.detach().cpu()
+    cpu_misaligned = misaligned.detach().cpu()
+    cpu_anchor_base = anchor_base.detach().cpu()
+
     # create more triplets by applying mirroring augmentation
     # positive and negative always share the same mirror
     # anchor always has a different mirror
@@ -382,18 +401,16 @@ def _create_pool_reconstruction(
     for i_batch in range(n_particles):
         combinations_subset = random.sample(MIRROR_COMBINATIONS, 2)
         for mirror_combo in combinations_subset:
-            mirrored_aligned = apply_mirror(
-                aligned[i_batch].clone(), mirror_combo
-            ).cpu()
+            mirrored_aligned = apply_mirror(cpu_aligned[i_batch].clone(), mirror_combo)
             mirrored_misaligned = apply_mirror(
-                misaligned[i_batch].clone(), mirror_combo
-            ).cpu()
+                cpu_misaligned[i_batch].clone(), mirror_combo
+            )
 
             other_combos = [c for c in MIRROR_COMBINATIONS if c != mirror_combo]
             anchor_mirror = random.choice(other_combos)
             mirrored_anchor = apply_mirror(
-                anchor_base[i_batch].clone(), anchor_mirror
-            ).cpu()
+                cpu_anchor_base[i_batch].clone(), anchor_mirror
+            )
 
             triplet = [
                 (mirrored_aligned, 1),

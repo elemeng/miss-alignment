@@ -59,15 +59,17 @@ class ReconstructionPoolDataset(Dataset):
         """List all files in this worker's partition.
 
         Files are named: partition_{partition_id}_worker_{worker_id}_seq_{seq_id}.pickle
-        Multiple reconstruction workers write to each partition.
+        Multiple reconstruction workers write to each partition. Files live in
+        a per-partition subdirectory matching the reconstruction worker's layout.
         """
         if self.partition_id is None:
             raise RuntimeError(
                 "partition_id not set. Ensure worker_init_fn assigns it."
             )
         pattern = f"partition_{self.partition_id}_worker_*_seq_*.pickle"
+        partition_dir = self.pool_dir / f"partition_{self.partition_id}"
         # Filter out temp files (they start with tmp_)
-        return [f for f in self.pool_dir.glob(pattern) if not f.name.startswith("tmp_")]
+        return [f for f in partition_dir.glob(pattern) if not f.name.startswith("tmp_")]
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, ...]:
         """
