@@ -19,6 +19,7 @@ def run_alignment_parallel(
     optimizer: str | None = None,
     optimizer_kwargs: dict | None = None,
     position_subsample_fraction: float | None = None,
+    session=None,
 ) -> dict[str, float]:
     """Distribute per-tilt-series alignment across local GPUs or a cluster.
 
@@ -30,6 +31,9 @@ def run_alignment_parallel(
     The optional performance knobs (oversampling, optimizer,
     optimizer_kwargs, position_subsample_fraction) fall back to
     evaluate_tilt_series defaults when None.
+
+    Pass ``session`` (a PersistentSession) to reuse one warm worker pool
+    across several alignment phases instead of provisioning per phase.
 
     Returns dict mapping tilt-series stem names to their final loss values.
     """
@@ -52,4 +56,5 @@ def run_alignment_parallel(
         optimizer=optimizer,
         optimizer_kwargs=optimizer_kwargs,
         position_subsample_fraction=position_subsample_fraction,
+        session=session,
     )

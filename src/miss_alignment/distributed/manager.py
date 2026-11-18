@@ -24,8 +24,10 @@ from .queue import (
     TaskSpec,
     _orphan_shard,
     clear_queue,
+    clear_stop,
     compute_fingerprint,
     write_pending,
+    write_stop,
 )
 
 _POLL_INTERVAL_S = 0.5
@@ -139,6 +141,144 @@ def _scheduler_thread(
         stop_event.set()  # wake the poll loop so it notices immediately
 
 
+class PersistentSession:
+    """Long-lived worker pool shared by the alignment phases of one run.
+
+    A normal ``run_distributed`` call tears down its workers and queue when the
+    phase ends. Across a multi-iteration training run that means every
+    macro-iteration pays a cold start: fresh processes, torch/warpylib
+    imports, checkpoint loads, and new CUDA contexts.
+
+    A session keeps the queue directory, the provisioner, and the workers
+    alive between phases. Workers run with ``persistent=True``, so they idle
+    (cheaply) when the queue drains and pick up the next phase's tasks. The
+    owning process closes the session once at the end of the run, which writes
+    the STOP marker and shuts the pool down.
+
+    Usage::
+
+        with PersistentSession(queue_root, devices, n_cluster_workers) as session:
+            for it in iterations:
+                run_distributed(..., session=session)
+    """
+
+    def __init__(
+        self,
+        queue_root: Path,
+        devices: list[int],
+        n_cluster_workers: int | None = None,
+    ) -> None:
+        self.layout = QueueLayout(queue_root)
+        self.layout.ensure_directories()
+        self.devices = devices
+        self.n_cluster_workers = n_cluster_workers
+
+        self._stop_event = threading.Event()
+        self._scheduler_errors: list = []
+        self._worker_counts: dict = {}
+        self._scheduler: threading.Thread | None = None
+        self._provisioner: WorkerProvisioner | None = None
+        self._closed = False
+
+    @property
+    def queue_root(self) -> Path:
+        return self.layout.root
+
+    def __enter__(self) -> PersistentSession:  # noqa: PYI034
+        self._provisioner = _build_provisioner(
+            self.queue_root,
+            self.devices,
+            self.n_cluster_workers,
+            persistent=True,
+        )
+        n_workers = _worker_count(self.devices, self.n_cluster_workers)
+
+        # Clear any stale STOP marker from a previous run in this directory.
+        clear_stop(self.layout)
+        _write_manager_hb(self.layout, seq=0)
+        self._start_scheduler(n_workers)
+        return self
+
+    def _start_scheduler(self, n_workers: int) -> None:
+        assert self._provisioner is not None
+        self._scheduler = threading.Thread(
+            target=_scheduler_thread,
+            args=(
+                self.layout,
+                self._provisioner,
+                n_workers,
+                self._stop_event,
+                self._scheduler_errors,
+                self._worker_counts,
+            ),
+            daemon=True,
+        )
+        self._scheduler.start()
+        self._provisioner.ensure_workers(n_workers)
+
+    def ensure_running(self) -> None:
+        """Validate the pool is alive; raise if the scheduler died."""
+        if self._closed:
+            raise RuntimeError("PersistentSession is already closed")
+        if self._scheduler_errors:
+            raise RuntimeError("Scheduler thread crashed") from self._scheduler_errors[
+                0
+            ]
+
+    @property
+    def worker_counts(self) -> dict:
+        return self._worker_counts
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # Tell persistent workers to exit, then stop the scheduler and pool.
+        try:
+            write_stop(self.layout)
+        except OSError as exc:  # queue dir may already be gone
+            print(f"[session] could not write stop marker: {exc}", file=sys.stderr)
+        self._stop_event.set()
+        if self._scheduler is not None:
+            self._scheduler.join(timeout=5.0)
+        if self._provisioner is not None:
+            self._provisioner.shutdown()
+        shutil.rmtree(self.layout.root, ignore_errors=True)
+
+
+def _worker_count(devices: list[int], n_cluster_workers: int | None) -> int:
+    if n_cluster_workers is not None:
+        return n_cluster_workers
+    return len(devices)
+
+
+def _build_provisioner(
+    queue_root: Path,
+    devices: list[int],
+    n_cluster_workers: int | None,
+    persistent: bool = False,
+) -> WorkerProvisioner:
+    """Create the provisioner matching the requested execution mode."""
+    if n_cluster_workers is not None:
+        cluster_config = load_cluster_config()
+        cluster = ClusterProvisioner(queue_dir=queue_root, config=cluster_config)
+        if devices:
+            # Also use local GPUs — the queue is shared so local and cluster
+            # workers pull from the same task list with no extra coordination.
+            local = LocalProvisioner(
+                queue_dir=queue_root, devices=devices, persistent=persistent
+            )
+            return CompositeProvisioner([cluster, local])
+        return cluster
+    return LocalProvisioner(
+        queue_dir=queue_root, devices=devices, persistent=persistent
+    )
+
+
 def run_distributed(
     tilt_series_list: list[Path],
     model_checkpoint: Path,
@@ -159,20 +299,31 @@ def run_distributed(
     optimizer: str | None = None,
     optimizer_kwargs: dict | None = None,
     position_subsample_fraction: float | None = None,
+    session: PersistentSession | None = None,
 ) -> dict[str, float]:
     """Write tasks, provision workers, block until all tasks are terminal.
 
     Returns dict[series_name → final_loss]. Raises RuntimeError listing all
-    failed series if any task ends in failed/. Deletes queue_root on exit.
+    failed series if any task ends in failed/.
+
+    Without a ``session`` the queue and workers are created and destroyed
+    around this call. Pass a :class:`PersistentSession` to reuse one warm
+    worker pool across several phases; in that case this function only adds
+    this phase's tasks and waits for them, leaving the pool running.
 
     task_type selects the worker dispatch path:
       "alignment"          — evaluate_tilt_series (default)
       "prepare_stacks"     — _prepare_single_tilt_series
       "cross_correlation"  — _run_cross_correlation_single
     """
-    layout = QueueLayout(queue_root)
-    layout.ensure_directories()
-    clear_queue(layout)
+    if session is not None:
+        # Shared pool: reuse its layout, only reset this phase's task state.
+        layout = session.layout
+        clear_queue(layout)
+    else:
+        layout = QueueLayout(queue_root)
+        layout.ensure_directories()
+        clear_queue(layout)
 
     # Fingerprint only meaningful for alignment tasks (amortizes model load).
     if task_type == "alignment":
@@ -220,37 +371,38 @@ def run_distributed(
         )
         write_pending(layout, spec)
 
-    # Write first heartbeat before starting workers so workers never see a
-    # missing heartbeat on startup (would cause immediate exit).
-    _write_manager_hb(layout, seq=0)
-
-    if n_cluster_workers is not None:
-        cluster_config = load_cluster_config()
-        cluster = ClusterProvisioner(queue_dir=queue_root, config=cluster_config)
-        if devices:
-            # Also use local GPUs — the queue is shared so local and cluster
-            # workers pull from the same task list with no extra coordination.
-            local = LocalProvisioner(queue_dir=queue_root, devices=devices)
-            provisioner: WorkerProvisioner = CompositeProvisioner([cluster, local])
-        else:
-            provisioner = cluster
-        n_workers = n_cluster_workers
+    if session is not None:
+        session.ensure_running()
+        provisioner = None
+        scheduler = None
+        stop_event = None
+        scheduler_errors = session._scheduler_errors
+        worker_counts = session.worker_counts
     else:
-        provisioner = LocalProvisioner(queue_dir=queue_root, devices=devices)
-        n_workers = len(devices)
+        # Write first heartbeat before starting workers so workers never see a
+        # missing heartbeat on startup (would cause immediate exit).
+        _write_manager_hb(layout, seq=0)
 
-    stop_event = threading.Event()
-    scheduler_errors: list = []
-    worker_counts: dict = {}
-    scheduler = threading.Thread(
-        target=_scheduler_thread,
-        args=(
-            layout, provisioner, n_workers, stop_event, scheduler_errors, worker_counts
-        ),
-        daemon=True,
-    )
-    scheduler.start()
-    provisioner.ensure_workers(n_workers)
+        provisioner = _build_provisioner(queue_root, devices, n_cluster_workers)
+        n_workers = _worker_count(devices, n_cluster_workers)
+
+        stop_event = threading.Event()
+        scheduler_errors: list = []
+        worker_counts: dict = {}
+        scheduler = threading.Thread(
+            target=_scheduler_thread,
+            args=(
+                layout,
+                provisioner,
+                n_workers,
+                stop_event,
+                scheduler_errors,
+                worker_counts,
+            ),
+            daemon=True,
+        )
+        scheduler.start()
+        provisioner.ensure_workers(n_workers)
 
     pending_ids = set(task_ids)
     losses: dict[str, float] = {}
@@ -294,10 +446,13 @@ def run_distributed(
                     )
     finally:
         pbar.close()
-        stop_event.set()
-        scheduler.join(timeout=5.0)
-        provisioner.shutdown()
-        shutil.rmtree(queue_root, ignore_errors=True)
+        if session is None:
+            # One-shot mode: tear the pool down with this phase.
+            stop_event.set()
+            scheduler.join(timeout=5.0)
+            provisioner.shutdown()
+            shutil.rmtree(queue_root, ignore_errors=True)
+        # Shared pool: leave workers running; the session owns teardown.
 
     if failed_series:
         raise RuntimeError(

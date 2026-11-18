@@ -16,7 +16,6 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Optional
 
 import torch
 import typer
@@ -31,6 +30,7 @@ from .queue import (
     claim_one,
     mark_done,
     mark_failed,
+    stop_requested,
 )
 
 _MANAGER_HB_TIMEOUT_S = 120.0
@@ -149,13 +149,26 @@ def _execute_task(
         raise ValueError(f"Unknown task_type: {spec.task_type!r}")
 
 
+# Idle poll interval for persistent workers waiting for the next phase.
+_IDLE_POLL_S = 1.0
+
+
 def run_worker_loop(
     layout: QueueLayout,
     worker_id: str,
     device: str,
     manager_hb_timeout_s: float = _MANAGER_HB_TIMEOUT_S,
+    persistent: bool = False,
 ) -> str:
-    """Main worker loop: claim → evaluate → write result. Repeat until queue empty.
+    """Main worker loop: claim → evaluate → write result.
+
+    With ``persistent=False`` (default) the worker exits as soon as the queue
+    is empty, which is the right behaviour for one-shot phases.
+
+    With ``persistent=True`` the worker stays alive when the queue drains and
+    waits for the next phase, so a multi-iteration run pays model import and
+    CUDA context setup once instead of once per macro-iteration. It then exits
+    when the owning process writes the queue's stop marker.
 
     Returns an exit-reason string suitable for writing to logs/<worker_id>.exit.
     """
@@ -169,20 +182,48 @@ def run_worker_loop(
     cached_model: MissAlignment | None = None
     tasks_done = 0
     tasks_failed = 0
+    empty_since: float | None = None
 
     try:
         while True:
             age = _manager_hb_age_s(layout)
+
+            spec = claim_one(layout, worker_id)
+
+            if spec is None:
+                if not persistent:
+                    return f"queue empty; done={tasks_done} failed={tasks_failed}"
+
+                # Persistent mode: distinguish "between phases" from "run over".
+                # A stop marker is authoritative; a stale manager heartbeat is
+                # only honoured while idle, because a long-running task can
+                # legitimately outlive several heartbeat intervals.
+                if stop_requested(layout):
+                    return f"stop requested; done={tasks_done} failed={tasks_failed}"
+                if empty_since is None:
+                    empty_since = time.time()
+                time.sleep(_IDLE_POLL_S)
+                continue
+
+            empty_since = None
+
             if age > manager_hb_timeout_s:
+                # Queue had work but the manager is gone: requeue the claim so
+                # a future manager can pick it up, then exit.
+                mark_failed(
+                    layout,
+                    worker_id,
+                    spec,
+                    error=(
+                        f"manager heartbeat stale ({age:.0f}s > "
+                        f"{manager_hb_timeout_s:.0f}s); worker exiting"
+                    ),
+                )
                 return (
                     f"manager heartbeat stale ({age:.0f}s > "
                     f"{manager_hb_timeout_s:.0f}s); "
                     f"done={tasks_done} failed={tasks_failed}"
                 )
-
-            spec = claim_one(layout, worker_id)
-            if spec is None:
-                return f"queue empty; done={tasks_done} failed={tasks_failed}"
 
             # For alignment tasks, (re)load model when fingerprint changes.
             if (
@@ -214,8 +255,15 @@ def run_worker_loop(
 def worker_miss_align(
     queue_dir: Path = typer.Option(..., help="Path to the tasks/ queue directory."),
     device: int = typer.Option(0, help="GPU device index to use."),
-    worker_id: Optional[str] = typer.Option(
+    worker_id: str | None = typer.Option(
         None, help="Unique worker ID. Defaults to local-<pid>-gpu<device>."
+    ),
+    persistent: bool = typer.Option(
+        False,
+        help="Stay alive when the queue drains and wait for the next phase "
+        "instead of exiting. Exits when the queue's STOP marker appears. "
+        "Used by multi-iteration runs to avoid re-importing torch and "
+        "re-creating CUDA contexts once per macro-iteration.",
     ),
 ) -> None:
     """Claim and run inference tasks from the distributed queue."""
@@ -228,7 +276,9 @@ def worker_miss_align(
     cuda_device = f"cuda:{device}" if torch.cuda.is_available() else "cpu"
     exit_reason = "unknown (unhandled exception)"
     try:
-        exit_reason = run_worker_loop(layout, worker_id, cuda_device)
+        exit_reason = run_worker_loop(
+            layout, worker_id, cuda_device, persistent=persistent
+        )
     except Exception:
         exit_reason = f"unhandled exception:\n{traceback.format_exc()}"
         raise

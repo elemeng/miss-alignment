@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import os
 import socket
@@ -20,6 +21,7 @@ from .alignment import run_alignment_parallel
 from .data import DEFAULT_POOL_SIZE, MissAlignmentDataModule
 from .data.io import exclude_nonfinite_alignment_tilt_series
 from .data.shift_generation import create_default_generator
+from .distributed.manager import PersistentSession
 from .models import MAEarlyStopping, MAProgressBar, MissAlignment
 from .prepare_stacks import prepare_stacks_parallel
 from .preprocessing import run_cross_correlation_alignment_parallel
@@ -398,9 +400,7 @@ def train_miss_align(
     if alignment_devices is not None:
         devices_alignment = parse_device_list(alignment_devices)
         if not devices_alignment:
-            raise ValueError(
-                "--alignment-devices must list at least one device index"
-            )
+            raise ValueError("--alignment-devices must list at least one device index")
         invalid = [d for d in devices_alignment if d >= n_visible_gpus]
         if invalid:
             raise ValueError(
@@ -490,92 +490,104 @@ def train_miss_align(
     # Resolve the reconstruction pool size once (CLI value > env var > default)
     resolved_pool_size = _resolve_pool_size(pool_size)
 
-    for x in range(start_iter, end_iter):
-        # ============================================================
-        # ================= model training step ======================
-        # ============================================================
-        iteration_settings = general_config["iteration_settings"][x]
-        alignment_mode = iteration_settings["alignment"]
-        print(f"\n{'=' * 60}")
-        print(f"Iteration {x + 1}/{end_iter} - Alignment: {alignment_mode}")
-        print(f"{'=' * 60}\n")
+    # One worker pool for every alignment phase of this run: workers stay
+    # warm (torch imported, CUDA contexts created, checkpoint cached) instead
+    # of being restarted per macro-iteration. Cluster mode keeps its own
+    # per-phase submission behaviour, so the session is local-only.
+    session_queue_root = training_directory / "tasks"
+    if n_cluster_workers is None:
+        session_context = PersistentSession(session_queue_root, devices_alignment)
+    else:
+        session_context = contextlib.nullcontext(None)
 
-        # Run the training phase. Multi-GPU spawns one DDP worker per training
-        # device and joins; single-GPU runs in-process. Either way the main
-        # process is single-process again once this returns, with the best
-        # checkpoint published at training_directory / model.ckpt.
-        world_size = len(devices_training)
-        worker_args = (
-            world_size,
-            _find_free_port(),
-            x,
-            training_model_path,
-            training_directory,
-            devices_training,
-            devices_reconstruction,
-            general_config,
-            model_training_config,
-            data_module_config,
-            shift_generation_config,
-            iteration_settings,
-            dataloaders_per_trainer,
-            resolved_pool_size,
-        )
-        if world_size > 1:
-            torch_mp.spawn(
-                _training_worker, args=worker_args, nprocs=world_size, join=True
+    with session_context as alignment_session:
+        for x in range(start_iter, end_iter):
+            # ============================================================
+            # ================= model training step ======================
+            # ============================================================
+            iteration_settings = general_config["iteration_settings"][x]
+            alignment_mode = iteration_settings["alignment"]
+            print(f"\n{'=' * 60}")
+            print(f"Iteration {x + 1}/{end_iter} - Alignment: {alignment_mode}")
+            print(f"{'=' * 60}\n")
+
+            # Run the training phase. Multi-GPU spawns one DDP worker per training
+            # device and joins; single-GPU runs in-process. Either way the main
+            # process is single-process again once this returns, with the best
+            # checkpoint published at training_directory / model.ckpt.
+            world_size = len(devices_training)
+            worker_args = (
+                world_size,
+                _find_free_port(),
+                x,
+                training_model_path,
+                training_directory,
+                devices_training,
+                devices_reconstruction,
+                general_config,
+                model_training_config,
+                data_module_config,
+                shift_generation_config,
+                iteration_settings,
+                dataloaders_per_trainer,
+                resolved_pool_size,
             )
-        else:
-            _training_worker(0, *worker_args)
+            if world_size > 1:
+                torch_mp.spawn(
+                    _training_worker, args=worker_args, nprocs=world_size, join=True
+                )
+            else:
+                _training_worker(0, *worker_args)
 
-        # This known path was written by rank 0 and is used for alignment and
-        # as the starting checkpoint for the next iteration.
-        training_model_path = training_directory / "model.ckpt"
+            # This known path was written by rank 0 and is used for alignment and
+            # as the starting checkpoint for the next iteration.
+            training_model_path = training_directory / "model.ckpt"
 
-        # ============================================================
-        # =============== tilt-series alignment step =================
-        # ============================================================
+            # ============================================================
+            # =============== tilt-series alignment step =================
+            # ============================================================
 
-        # get list of all files to process for alignment
-        tilt_series_list = list(training_directory.glob("*.xml"))
+            # get list of all files to process for alignment
+            tilt_series_list = list(training_directory.glob("*.xml"))
 
-        # run alignment in parallel over all available devices
-        run_alignment_parallel(
-            model_checkpoint=str(training_model_path),
-            tilt_series_list=tilt_series_list,
-            output_directory=training_directory,
-            setting=iteration_settings["alignment"],
-            patch_size=alignment_config["patch_size"],
-            patch_overlap=alignment_config["patch_overlap"],
-            batch_size=alignment_config["batch_size"],
-            apply_ctf=general_config["apply_ctf"],
-            downsample=iteration_settings["downsample"],
-            devices_list=devices_alignment,
-            n_cluster_workers=n_cluster_workers,
-            # optional performance knobs (None → evaluate_tilt_series defaults)
-            oversampling=alignment_config.get("oversampling"),
-            optimizer=alignment_config.get("optimizer"),
-            optimizer_kwargs=alignment_config.get("optimizer_kwargs"),
-            position_subsample_fraction=alignment_config.get(
-                "position_subsample_fraction"
-            ),
-        )
+            # run alignment in parallel over all available devices
+            run_alignment_parallel(
+                model_checkpoint=str(training_model_path),
+                tilt_series_list=tilt_series_list,
+                output_directory=training_directory,
+                setting=iteration_settings["alignment"],
+                patch_size=alignment_config["patch_size"],
+                patch_overlap=alignment_config["patch_overlap"],
+                batch_size=alignment_config["batch_size"],
+                apply_ctf=general_config["apply_ctf"],
+                downsample=iteration_settings["downsample"],
+                devices_list=devices_alignment,
+                n_cluster_workers=n_cluster_workers,
+                # optional performance knobs (None → evaluate_tilt_series defaults)
+                oversampling=alignment_config.get("oversampling"),
+                optimizer=alignment_config.get("optimizer"),
+                optimizer_kwargs=alignment_config.get("optimizer_kwargs"),
+                position_subsample_fraction=alignment_config.get(
+                    "position_subsample_fraction"
+                ),
+                session=alignment_session,
+            )
 
-        # make copies of the xml files and model after alignment
-        iteration_directory = training_directory / ("iter" + str(x + 1))
-        iteration_directory.mkdir(parents=True, exist_ok=True)
+            # make copies of the xml files and model after alignment
+            iteration_directory = training_directory / ("iter" + str(x + 1))
+            iteration_directory.mkdir(parents=True, exist_ok=True)
 
-        for xml_file in training_directory.glob("*.xml"):
-            destination_xml = iteration_directory / xml_file.name
-            copyfile(xml_file, destination_xml)
+            for xml_file in training_directory.glob("*.xml"):
+                destination_xml = iteration_directory / xml_file.name
+                copyfile(xml_file, destination_xml)
 
-            # copy the file with the alignment loss
-            loss_json = xml_file.stem + "_alignment_loss.json"
-            destination_json = iteration_directory / loss_json
-            copyfile(training_directory / loss_json, destination_json)
+                # copy the file with the alignment loss
+                loss_json = xml_file.stem + "_alignment_loss.json"
+                destination_json = iteration_directory / loss_json
+                copyfile(training_directory / loss_json, destination_json)
 
-        iteration_model_path = iteration_directory / "model.ckpt"
-        copyfile(training_model_path, iteration_model_path)
+            iteration_model_path = iteration_directory / "model.ckpt"
+            copyfile(training_model_path, iteration_model_path)
 
-        # training_model_path now points at the model just trained
-        # (set after the worker above); the next iteration starts from it.
+            # training_model_path now points at the model just trained
+            # (set after the worker above); the next iteration starts from it.

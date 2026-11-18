@@ -3,6 +3,7 @@
 A fake worker thread simulates cluster workers by polling pending/ and
 writing done/ or failed/ files.
 """
+
 import json
 import os
 import threading
@@ -13,7 +14,7 @@ from unittest.mock import patch
 import pytest
 
 from miss_alignment.distributed.manager import run_distributed
-from miss_alignment.distributed.queue import QueueLayout
+from miss_alignment.distributed.queue import QueueLayout, write_pending
 
 
 def _make_xml(tmp_path, name):
@@ -49,9 +50,7 @@ def _fake_worker_thread(queue_root, n_tasks, fail=False):
                     )
                 else:
                     done_data = {**data, "final_loss": 0.01, "device": "cpu"}
-                    (layout.done / f"{task_id}.json").write_text(
-                        json.dumps(done_data)
-                    )
+                    (layout.done / f"{task_id}.json").write_text(json.dumps(done_data))
                 (running_dir / f"{task_id}.json").unlink(missing_ok=True)
                 done_count += 1
             time.sleep(0.05)
@@ -263,3 +262,64 @@ class TestKnobsInFingerprint:
         base = self._fp()
         assert base != self._fp(patch_size=64)
         assert base != self._fp(downsample=2)
+
+
+class TestPersistentSession:
+    """The session keeps one pool warm across phases and tears it down once."""
+
+    def test_two_phases_share_one_pool(self, tmp_path, monkeypatch):
+        from miss_alignment.distributed import manager as mgr
+
+        spawned = []
+
+        class FakeProc:
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(cmd, **kwargs):
+            spawned.append(cmd)
+            return FakeProc()
+
+        monkeypatch.setattr(
+            "miss_alignment.distributed.provisioner.subprocess.Popen", fake_popen
+        )
+
+        queue_root = tmp_path / "tasks"
+        with mgr.PersistentSession(queue_root, devices=[0, 0]) as session:
+            assert len(spawned) == 2  # two slots
+            # Workers were asked to run persistently
+            assert all("--persistent" in cmd for cmd in spawned)
+
+            # Simulate two phases reusing the same pool
+            for _ in range(2):
+                session.ensure_running()
+                write_pending(session.layout, _speclike("phase"))
+
+            assert len(spawned) == 2  # no extra workers for phase 2
+
+        # Teardown removed the queue directory and wrote the stop marker first
+        assert not queue_root.exists()
+
+
+def _speclike(tag):
+    from miss_alignment.distributed.queue import TaskSpec
+
+    return TaskSpec(
+        task_id=f"{tag}-{id(tag)}",
+        model_checkpoint_path="/m.ckpt",
+        tilt_series_path="/t.xml",
+        output_directory="/out",
+        setting="anchoring",
+        patch_size=96,
+        patch_overlap=0.1,
+        batch_size=16,
+        apply_ctf=False,
+        downsample=1,
+        init_fingerprint="fp",
+    )

@@ -6,6 +6,7 @@ model-reuse, heartbeat-exit, and result-write logic without CUDA.
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -245,3 +246,83 @@ def test_worker_dispatches_cross_correlation(layout):
     assert len(xcorr_calls) == 1
     assert xcorr_calls[0][1] == 0.25
     assert (layout.done / "0000001-ts01.json").exists()
+
+
+class TestPersistentWorker:
+    """Persistent workers idle between phases instead of exiting."""
+
+    def _patch_exec(self, count_sink):
+        def fake_eval(**kwargs):
+            count_sink.append(1)
+            return Path("/data/x.xml"), [0.5]
+
+        return (
+            patch(
+                "miss_alignment.distributed.worker.evaluate_tilt_series",
+                side_effect=fake_eval,
+            ),
+            patch(
+                "miss_alignment.distributed.worker.MissAlignment.load_from_checkpoint",
+                return_value=MagicMock(),
+            ),
+        )
+
+    def test_persistent_worker_waits_then_stops(self, layout):
+        from miss_alignment.distributed.queue import write_stop
+
+        calls = []
+        _write_manager_hb(layout)
+        write_pending(layout, _spec())
+
+        stop_after = threading.Timer(1.0, lambda: write_stop(layout))
+        stop_after.start()
+        p1, p2 = self._patch_exec(calls)
+        try:
+            with p1, p2:
+                reason = run_worker_loop(layout, "worker-0", "cpu", persistent=True)
+        finally:
+            stop_after.join()
+
+        assert "stop requested" in reason
+        assert len(calls) == 1
+
+    def test_persistent_worker_picks_up_next_phase(self, layout):
+        """A task queued after the queue drained must still be processed."""
+        from miss_alignment.distributed.queue import write_stop
+
+        calls = []
+        _write_manager_hb(layout)
+        write_pending(layout, _spec("0000001-ts01"))
+
+        def add_second_phase():
+            time.sleep(1.2)
+            _write_manager_hb(layout, seq=1)
+            write_pending(layout, _spec("0000002-ts02"))
+
+        def stop_later():
+            time.sleep(2.6)
+            write_stop(layout)
+
+        t1 = threading.Thread(target=add_second_phase)
+        t2 = threading.Thread(target=stop_later)
+        t1.start()
+        t2.start()
+        p1, p2 = self._patch_exec(calls)
+        try:
+            with p1, p2:
+                reason = run_worker_loop(layout, "worker-0", "cpu", persistent=True)
+        finally:
+            t1.join()
+            t2.join()
+
+        assert "stop requested" in reason
+        assert len(calls) == 2
+
+    def test_non_persistent_exits_when_empty(self, layout):
+        calls = []
+        _write_manager_hb(layout)
+        write_pending(layout, _spec())
+        p1, p2 = self._patch_exec(calls)
+        with p1, p2:
+            reason = run_worker_loop(layout, "worker-0", "cpu", persistent=False)
+        assert "queue empty" in reason

@@ -56,6 +56,16 @@ class QueueLayout:
     def logs(self) -> Path:
         return self.root / "logs"
 
+    @property
+    def stop_marker(self) -> Path:
+        """Sentinel telling persistent workers to exit for good.
+
+        Used only in persistent mode (workers outliving a single phase).
+        Written by the owning process when the whole run finishes, so idle
+        workers can distinguish "between phases" from "run over".
+        """
+        return self.root / "STOP"
+
     def ensure_directories(self) -> None:
         for d in (
             self.pending,
@@ -282,3 +292,17 @@ def clear_queue(layout: QueueLayout) -> None:
             worker_dir.rmdir()
         except OSError:
             pass  # not empty yet; scheduler will sweep it
+
+
+def write_stop(layout: QueueLayout) -> None:
+    """Signal persistent workers to exit once the queue is drained."""
+    layout.root.mkdir(parents=True, exist_ok=True)
+    layout.stop_marker.write_text("stop\n")
+
+
+def stop_requested(layout: QueueLayout) -> bool:
+    return layout.stop_marker.exists()
+
+
+def clear_stop(layout: QueueLayout) -> None:
+    layout.stop_marker.unlink(missing_ok=True)

@@ -66,14 +66,18 @@ def test_load_cluster_config_explicit_scheduler(monkeypatch, tmp_path, cluster_s
     assert cfg.scheduler == "slurm"
 
 
-def test_load_cluster_config_raises_on_missing_file(monkeypatch, tmp_path, cluster_script):
+def test_load_cluster_config_raises_on_missing_file(
+    monkeypatch, tmp_path, cluster_script
+):
     monkeypatch.setenv("MISS_CLUSTER_CONFIG", str(tmp_path / "nonexistent.json"))
     monkeypatch.setenv("MISS_CLUSTER_SCRIPT", str(cluster_script))
     with pytest.raises(FileNotFoundError):
         load_cluster_config()
 
 
-def test_load_cluster_config_raises_on_missing_key(monkeypatch, tmp_path, cluster_script):
+def test_load_cluster_config_raises_on_missing_key(
+    monkeypatch, tmp_path, cluster_script
+):
     bad = tmp_path / "bad.json"
     bad.write_text('{"submit": "sbatch {{script_path}}"}')
     monkeypatch.setenv("MISS_CLUSTER_CONFIG", str(bad))
