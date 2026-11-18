@@ -18,6 +18,11 @@ import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+# Number of subdirectories the pending queue is split into. Keeps a claim
+# scan proportional to (queue / shards) instead of the whole queue;
+# 16 is far more than the worker counts this tool targets.
+_PENDING_SHARDS = 16
+
 
 @dataclass
 class QueueLayout:
@@ -113,8 +118,19 @@ def compute_fingerprint(
     batch_size: int,
     apply_ctf: bool,
     downsample: int,
+    oversampling: float | None = None,
+    optimizer: str | None = None,
+    optimizer_kwargs: dict | None = None,
+    position_subsample_fraction: float | None = None,
 ) -> str:
-    """SHA-256 over the fields that require reloading the model/settings."""
+    """SHA-256 over the fields that require reloading the model/settings.
+
+    The alignment performance knobs are included even though they do not
+    themselves require a model reload: the worker keys its cached state on
+    this fingerprint alone, so omitting them would let two tasks with
+    different reconstruction/optimization settings silently share cached
+    state instead of reloading.
+    """
     payload = json.dumps(
         {
             "model_checkpoint_path": model_checkpoint_path,
@@ -124,6 +140,10 @@ def compute_fingerprint(
             "batch_size": batch_size,
             "apply_ctf": apply_ctf,
             "downsample": downsample,
+            "oversampling": oversampling,
+            "optimizer": optimizer,
+            "optimizer_kwargs": optimizer_kwargs,
+            "position_subsample_fraction": position_subsample_fraction,
         },
         sort_keys=True,
     ).encode()
@@ -131,28 +151,69 @@ def compute_fingerprint(
 
 
 def write_pending(layout: QueueLayout, spec: TaskSpec) -> None:
-    _atomic_write(layout.pending / f"{spec.task_id}.json", asdict(spec))
+    """Queue a task in the shard its id maps to."""
+    _pending_shards(layout)  # ensure shards exist
+    shard = layout.pending / f"shard_{_shard_for(spec):02d}"
+    _atomic_write(shard / f"{spec.task_id}.json", asdict(spec))
+
+
+def _pending_shards(layout: QueueLayout) -> list[Path]:
+    """Return the shard directories under pending/, creating them on demand.
+
+    Sharding keeps each claim proportional to a fraction of the queue rather
+    than the whole queue: with N workers and M remaining tasks, unsharded
+    claiming costs O(N*M) directory scans per phase, which becomes noticeable
+    for datasets with many tilt series.
+    """
+    shards = []
+    for ordinal in range(_PENDING_SHARDS):
+        shard = layout.pending / f"shard_{ordinal:02d}"
+        shard.mkdir(parents=True, exist_ok=True)
+        shards.append(shard)
+    return shards
+
+
+def _orphan_shard(task_file: Path) -> int:
+    """Shard for an orphaned task file, from its "<task_id>.json" name."""
+    digest = hashlib.sha256(task_file.stem.encode()).digest()
+    return digest[0] % _PENDING_SHARDS
+
+
+def _shard_for(spec: TaskSpec) -> int:
+    """Deterministically map a task id to a shard (also used for orphans)."""
+    digest = hashlib.sha256(spec.task_id.encode()).digest()
+    return digest[0] % _PENDING_SHARDS
 
 
 def claim_one(layout: QueueLayout, worker_id: str) -> TaskSpec | None:
     """Attempt to claim a pending task via atomic rename.
+
+    Scans one shard at a time and stops at the first successful claim, so the
+    cost is bounded by the shard size rather than the whole queue. Shard
+    order is randomised per claim to avoid all workers racing on shard 0.
 
     Returns the claimed TaskSpec, or None if the queue is empty.
     """
     worker_dir = layout.worker_dir(worker_id)
     worker_dir.mkdir(parents=True, exist_ok=True)
 
-    candidates = list(layout.pending.glob("*.json"))
-    random.shuffle(candidates)
+    shards = _pending_shards(layout)
+    random.shuffle(shards)
 
-    for candidate in candidates:
-        dest = worker_dir / candidate.name
-        try:
-            os.rename(candidate, dest)
-            return _read_spec(dest)
-        except FileNotFoundError:
-            # another worker claimed it first
+    for shard in shards:
+        candidates = list(shard.glob("*.json"))
+        if not candidates:
             continue
+        random.shuffle(candidates)
+
+        for candidate in candidates:
+            dest = worker_dir / candidate.name
+            try:
+                os.rename(candidate, dest)
+                return _read_spec(dest)
+            except FileNotFoundError:
+                # another worker claimed it first
+                continue
 
     return None
 
@@ -192,15 +253,25 @@ def clear_queue(layout: QueueLayout) -> None:
     Order matters: wipe pending/done/failed first, THEN recover orphans into
     the now-empty pending/ so they are not immediately re-deleted.
     """
-    for directory in (layout.pending, layout.done, layout.failed):
-        for f in directory.glob("*.json"):
+    # Wipe pending shards (and any stray flat files from before sharding).
+    for pattern_root in (layout.pending, layout.done, layout.failed):
+        for f in pattern_root.glob("*.json"):
             f.unlink(missing_ok=True)
+        for shard in pattern_root.glob("shard_*"):
+            if shard.is_dir():
+                for f in shard.glob("*.json"):
+                    f.unlink(missing_ok=True)
+
+    _pending_shards(layout)  # ensure shards exist before recovering orphans
 
     for worker_dir in layout.running.iterdir():
         if not worker_dir.is_dir():
             continue
         for task_file in worker_dir.glob("*.json"):
-            dest = layout.pending / task_file.name
+            # Route the recovered orphan into its shard, matching write_pending
+            shard_name = f"shard_{_orphan_shard(task_file):02d}"
+            dest = layout.pending / shard_name / task_file.name
+            dest.parent.mkdir(parents=True, exist_ok=True)
             try:
                 os.rename(task_file, dest)
             except FileNotFoundError:

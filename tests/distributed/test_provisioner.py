@@ -338,3 +338,63 @@ def test_composite_provisioner_delegates_to_all(tmp_path):
     p.shutdown()
     a.shutdown.assert_called_once()
     b.shutdown.assert_called_once()
+
+
+class TestRepeatedDevices:
+    """Repeated device indices must each get their own worker slot."""
+
+    def test_ensure_workers_spawns_one_per_slot(self, tmp_path, monkeypatch):
+        from miss_alignment.distributed.provisioner import LocalProvisioner
+
+        spawned = []
+
+        class FakeProc:
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(cmd, **kwargs):
+            spawned.append(cmd)
+            return FakeProc()
+
+        monkeypatch.setattr(
+            "miss_alignment.distributed.provisioner.subprocess.Popen", fake_popen
+        )
+
+        prov = LocalProvisioner(queue_dir=tmp_path, devices=[0, 0, 1])
+        prov.ensure_workers(3)
+
+        # All three slots spawned, even though device 0 repeats
+        assert len(spawned) == 3
+        devices = [cmd[cmd.index("--device") + 1] for cmd in spawned]
+        assert devices == ["0", "0", "1"]
+        assert prov.live_worker_count() == 3
+
+    def test_repeated_devices_not_collapsed_on_respawn(self, tmp_path, monkeypatch):
+        """A second ensure_workers must not spawn duplicates for live slots."""
+        from miss_alignment.distributed.provisioner import LocalProvisioner
+
+        spawned = []
+
+        class FakeProc:
+            def poll(self):
+                return None
+
+        def fake_popen(cmd, **kwargs):
+            spawned.append(cmd)
+            return FakeProc()
+
+        monkeypatch.setattr(
+            "miss_alignment.distributed.provisioner.subprocess.Popen", fake_popen
+        )
+
+        prov = LocalProvisioner(queue_dir=tmp_path, devices=[0, 0])
+        prov.ensure_workers(2)
+        prov.ensure_workers(2)  # all still alive -> no new spawns
+
+        assert len(spawned) == 2

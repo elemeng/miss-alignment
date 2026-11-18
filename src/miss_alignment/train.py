@@ -302,6 +302,14 @@ def train_miss_align(
         "to run multiple workers per GPU (e.g., '0,0,1,1' runs 2 workers each "
         "on GPU 0 and GPU 1). Can overlap with training devices if needed.",
     ),
+    alignment_devices: str | None = typer.Option(
+        None,
+        help="Comma-separated list of GPU device indices for the alignment phase. "
+        "Each entry spawns one alignment worker. Devices can be repeated to run "
+        "multiple workers per GPU (e.g., '0,0' runs two workers on GPU 0), which "
+        "can help saturate one GPU when per-task work is memory-light. Defaults "
+        "to every visible GPU with one worker each.",
+    ),
     dataloaders_per_trainer: int = typer.Option(
         2,
         help="Number of CPU DataLoader workers per training device. "
@@ -383,9 +391,24 @@ def train_miss_align(
         str(max(1, _available_cpus() // len(devices_training))),
     )
 
-    # For alignment stage, use all visible GPUs
+    # For the alignment stage, default to every visible GPU with one worker
+    # each; --alignment-devices overrides this and may repeat devices to run
+    # several workers per GPU.
     n_visible_gpus = torch.cuda.device_count()
-    devices_alignment = list(range(n_visible_gpus))
+    if alignment_devices is not None:
+        devices_alignment = parse_device_list(alignment_devices)
+        if not devices_alignment:
+            raise ValueError(
+                "--alignment-devices must list at least one device index"
+            )
+        invalid = [d for d in devices_alignment if d >= n_visible_gpus]
+        if invalid:
+            raise ValueError(
+                f"--alignment-devices lists device(s) {invalid} but only "
+                f"{n_visible_gpus} visible GPU(s) exist"
+            )
+    else:
+        devices_alignment = list(range(n_visible_gpus))
 
     # Each macro-iteration runs two phases; report which devices each one uses.
     print("Macro-iteration phase 1 (model training):")

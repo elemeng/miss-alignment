@@ -22,6 +22,7 @@ from .provisioner import (
 from .queue import (
     QueueLayout,
     TaskSpec,
+    _orphan_shard,
     clear_queue,
     compute_fingerprint,
     write_pending,
@@ -73,7 +74,9 @@ def _sweep_stalled_workers(layout: QueueLayout) -> None:
             if (layout.failed / task_file.name).exists():
                 task_file.unlink(missing_ok=True)
                 continue
-            dest = layout.pending / task_file.name
+            # Route back into the shard this task id maps to
+            dest = layout.pending / f"shard_{_orphan_shard(task_file):02d}"
+            dest.parent.mkdir(parents=True, exist_ok=True)
             try:
                 os.rename(task_file, dest)
             except FileNotFoundError:
@@ -115,7 +118,12 @@ def _scheduler_thread(
 
             if now - last_sweep >= _SCHEDULER_INTERVAL_S:
                 _sweep_stalled_workers(layout)
-                n_pending = len(list(layout.pending.glob("*.json")))
+                # Count across shards (flat files from older layouts included)
+                n_pending = sum(
+                    1
+                    for pat in ("*.json", "shard_*/*.json")
+                    for _ in layout.pending.glob(pat)
+                )
                 if n_pending > 0:
                     # Cap at n_pending: no point submitting more workers than tasks.
                     # This also prevents resubmission when workers exit cleanly on
@@ -176,6 +184,10 @@ def run_distributed(
             batch_size=batch_size,
             apply_ctf=apply_ctf,
             downsample=downsample,
+            oversampling=oversampling,
+            optimizer=optimizer,
+            optimizer_kwargs=optimizer_kwargs,
+            position_subsample_fraction=position_subsample_fraction,
         )
     else:
         fingerprint = ""

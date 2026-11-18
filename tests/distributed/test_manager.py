@@ -30,7 +30,10 @@ def _fake_worker_thread(queue_root, n_tasks, fail=False):
         done_count = 0
         deadline = time.time() + 15
         while done_count < n_tasks and time.time() < deadline:
-            for f in list(layout.pending.glob("*.json")):
+            pending_files = list(layout.pending.glob("*.json")) + list(
+                layout.pending.glob("shard_*/*.json")
+            )
+            for f in pending_files:
                 data = json.loads(f.read_text())
                 task_id = data["task_id"]
                 running_dir = layout.running / "fake-worker"
@@ -212,3 +215,51 @@ def test_run_distributed_prepare_stacks_task_type(tmp_path):
 
     assert losses is not None
     assert "ts01" in losses
+
+
+class TestKnobsInFingerprint:
+    """The alignment performance knobs must participate in the fingerprint.
+
+    Workers key their cached model state on init_fingerprint alone. If the
+    knobs are omitted, two tasks in one queue with different settings would
+    silently share cached state instead of reloading.
+    """
+
+    def _fp(self, **overrides):
+        from miss_alignment.distributed.queue import compute_fingerprint
+
+        kwargs = dict(
+            model_checkpoint_path="m.ckpt",
+            setting="anchoring",
+            patch_size=96,
+            patch_overlap=0.1,
+            batch_size=16,
+            apply_ctf=False,
+            downsample=1,
+        )
+        kwargs.update(overrides)
+        return compute_fingerprint(**kwargs)
+
+    def test_defaults_are_stable(self):
+        assert self._fp() == self._fp()
+
+    def test_oversampling_changes_fingerprint(self):
+        assert self._fp(oversampling=2.0) != self._fp(oversampling=1.0)
+
+    def test_optimizer_changes_fingerprint(self):
+        assert self._fp(optimizer="lbfgs") != self._fp(optimizer="adam")
+
+    def test_optimizer_kwargs_changes_fingerprint(self):
+        assert self._fp(optimizer="adam", optimizer_kwargs={"n_steps": 40}) != self._fp(
+            optimizer="adam", optimizer_kwargs={"n_steps": 80}
+        )
+
+    def test_position_subsample_changes_fingerprint(self):
+        assert self._fp(position_subsample_fraction=1.0) != self._fp(
+            position_subsample_fraction=0.25
+        )
+
+    def test_knobs_do_not_break_existing_fingerprint_fields(self):
+        base = self._fp()
+        assert base != self._fp(patch_size=64)
+        assert base != self._fp(downsample=2)
