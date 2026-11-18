@@ -1,9 +1,10 @@
-import pytest
-import torch
 import pickle
 import time
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
+import torch
 
 from miss_alignment.data.training_dataset import ReconstructionPoolDataset
 
@@ -197,29 +198,59 @@ class TestReconstructionPoolDataset:
         result = dataset._normalize(volume)
         assert torch.all(torch.isfinite(result))
 
-    @patch("miss_alignment.data.training_dataset.random_contrast")
     @patch("miss_alignment.data.training_dataset.random_edge_mask")
     @patch("miss_alignment.data.training_dataset.random_cube_mask")
-    def test_prep_and_augment_no_mirror(
-        self, mock_cube, mock_edge, mock_contrast, dataset
-    ):
-        """Test augmentation pipeline does not include random_mirror."""
+    def test_prep_and_augment_no_mirror(self, mock_cube, mock_edge, dataset):
+        """Test augmentation pipeline does not include random_mirror.
+
+        Normalization and contrast jitter are fused into a single in-place
+        pass for speed, so there is no separate random_contrast call to mock;
+        the masks must still run once per volume.
+        """
         # Setup mocks to return input unchanged
-        mock_contrast.side_effect = lambda x: x
         mock_edge.side_effect = lambda x, **kwargs: x
         mock_cube.side_effect = lambda x: x
 
         volumes = [torch.randn(10, 10, 10) for _ in range(3)]
         _ = dataset._prep_and_augment(volumes)
 
-        # Check all augmentation functions were called
-        assert mock_contrast.call_count == 3
         assert mock_edge.call_count == 3
         assert mock_cube.call_count == 3
 
         # Check edge mask called with correct parameters
         for call in mock_edge.call_args_list:
             assert call[1]["edge_width"] == (1, 5)
+
+    def test_prep_and_augment_fused_normalize_contrast(self, dataset):
+        """Fused normalize+contrast equals the explicit two-step formulation.
+
+        Guards the optimisation: the in-place pass must reproduce
+        ``(v - mean) / std * std_change + mean_change`` exactly.
+        """
+        torch.manual_seed(3)
+        volumes = [torch.randn(10, 10, 10) for _ in range(3)]
+        originals = [v.clone() for v in volumes]
+
+        with (
+            patch("miss_alignment.data.training_dataset.random_edge_mask") as m1,
+            patch("miss_alignment.data.training_dataset.random_cube_mask") as m2,
+        ):
+            m1.side_effect = lambda x, **kw: x
+            m2.side_effect = lambda x: x
+            torch.manual_seed(11)
+            fused = dataset._prep_and_augment([v.clone() for v in volumes])
+
+        torch.manual_seed(11)
+        expected = []
+        for v in originals:
+            mean = torch.mean(v)
+            std = torch.std(v).clamp(min=1e-6)
+            a = torch.normal(1, 0.1, (1,), device=v.device)
+            b = torch.normal(0, 0.1, (1,), device=v.device)
+            expected.append((v - mean) / std * a + b)
+
+        for got, want in zip(fused, expected):
+            torch.testing.assert_close(got, want, atol=1e-6, rtol=1e-5)
 
     def test_channel_dimension_addition(self, dataset, mock_pool_dir, sample_data):
         """Test that channel dimension is added correctly."""
