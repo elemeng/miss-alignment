@@ -529,6 +529,13 @@ def train_miss_align(
             downsample=iteration_settings["downsample"],
             devices_list=devices_alignment,
             n_cluster_workers=n_cluster_workers,
+            # optional performance knobs (None → evaluate_tilt_series defaults)
+            oversampling=alignment_config.get("oversampling"),
+            optimizer=alignment_config.get("optimizer"),
+            optimizer_kwargs=alignment_config.get("optimizer_kwargs"),
+            position_subsample_fraction=alignment_config.get(
+                "position_subsample_fraction"
+            ),
         )
 
         # make copies of the xml files and model after alignment

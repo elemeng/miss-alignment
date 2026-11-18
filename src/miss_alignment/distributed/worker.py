@@ -116,6 +116,16 @@ def _execute_task(
             downsample=spec.downsample,
             device=device,
             model=cached_model,
+            # Performance knobs; None falls back to evaluate_tilt_series
+            # defaults (LBFGS, oversampling 2.0, no subsampling).
+            oversampling=spec.oversampling if spec.oversampling is not None else 2.0,
+            optimizer=spec.optimizer or "lbfgs",
+            optimizer_kwargs=spec.optimizer_kwargs,
+            position_subsample_fraction=(
+                spec.position_subsample_fraction
+                if spec.position_subsample_fraction is not None
+                else 1.0
+            ),
         )
         return float(loss_values[-1]) if loss_values else float("nan")
 

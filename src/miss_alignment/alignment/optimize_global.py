@@ -35,6 +35,9 @@ def optimize_shifts(
     apply_ctf: bool = True,
     device: str | torch.device = "cpu",
     max_retries: int = 3,
+    oversampling: float = 2.0,
+    optimizer: str = "lbfgs",
+    optimizer_kwargs: dict | None = None,
     device_override: str | torch.device | None = None,
 ):
     """Find shifts to optimize model score.
@@ -70,6 +73,25 @@ def optimize_shifts(
         When set by a multi-pass caller (e.g. iterative anchoring) that keeps
         model and tilt series resident on this device across passes, skips the
         device transfers in both directions; the caller owns moving data back.
+        Whether to apply CTF correction.
+    device : str
+        Device to run optimization on.
+    max_retries : int
+        Maximum number of retry attempts if NaN is encountered.
+    oversampling : float, default 2.0
+        Reconstruction oversampling factor passed to
+        ``reconstruct_subvolumes_single``. Lowering it (e.g. 1.0) reduces
+        the Fourier grid volume and is a reasonable speed/quality tradeoff
+        for coarse, downsampled iterations.
+    optimizer : str, default "lbfgs"
+        Gradient optimizer for the alignment parameters: "lbfgs" (strong
+        Wolfe line search, few high-quality steps) or "adam" (fixed learning
+        rate, many cheap steps). Adam needs ``optimizer_kwargs`` with an
+        ``n_steps`` value; LBFGS ignores it.
+    optimizer_kwargs : dict | None
+        Extra optimizer settings. For "adam": ``n_steps`` (default 40),
+        ``lr`` (default 5e-3). For "lbfgs": no extra settings are used
+        (strong_wolfe line search is fixed).
 
     Returns
     -------
@@ -157,6 +179,9 @@ def optimize_shifts(
                 apply_ctf=apply_ctf,
                 device=device,
                 original_precision=original_precision,
+                oversampling=oversampling,
+                optimizer=optimizer,
+                optimizer_kwargs=optimizer_kwargs,
                 device_override=device_override,
             )
         except AlignmentNanError:
@@ -256,6 +281,9 @@ def _optimize_shifts_inner(
     apply_ctf: bool,
     device: str | torch.device,
     original_precision: str,
+    oversampling: float = 2.0,
+    optimizer: str = "lbfgs",
+    optimizer_kwargs: dict | None = None,
     device_override: str | torch.device | None = None,
 ):
     """Inner optimization function that can raise AlignmentNanError.
@@ -265,10 +293,13 @@ def _optimize_shifts_inner(
     tuple[TiltSeries, list[float]]
         Optimized tilt series and list of loss values.
     """
-    # move all modules to device in place. When called from the anchoring
-    # wrapper, a device_override indicates the caller keeps everything resident
-    # on device across passes, so the final move back to CPU is skipped here.
-    device = device_override if device_override is not None else device
+    optimizer_kwargs = dict(optimizer_kwargs or {})
+    if optimizer not in ("lbfgs", "adam"):
+        raise ValueError(f"Unknown optimizer: {optimizer!r} (use 'lbfgs' or 'adam')")
+
+    # move all modules to device in place. When called from a multi-pass
+    # caller (anchoring) that keeps everything resident on device, skip both
+    # directions of transfer; the caller owns moving data back.
     if device_override is None:
         tilt_series.to(device)
         model.to(device)
@@ -344,10 +375,18 @@ def _optimize_shifts_inner(
     else:
         raise ValueError(f"Invalid setting for alignment optimization: {setting}")
 
-    alignment_optimizer = torch.optim.LBFGS(
-        parameters,
-        line_search_fn="strong_wolfe",
-    )
+    if optimizer == "adam":
+        alignment_optimizer = torch.optim.Adam(
+            parameters,
+            lr=optimizer_kwargs.get("lr", 5e-3),
+        )
+        n_steps = int(optimizer_kwargs.get("n_steps", 40))
+    else:
+        alignment_optimizer = torch.optim.LBFGS(
+            parameters,
+            line_search_fn="strong_wolfe",
+        )
+        n_steps = 1  # strong_wolfe line search converges within one step
 
     # Initialize list to store loss values
     loss_values = []
@@ -409,7 +448,7 @@ def _optimize_shifts_inner(
                     pixel_size=pixel_size,
                     size=patch_size,
                     apply_ctf=apply_ctf,
-                    oversampling=2.0,
+                    oversampling=oversampling,
                 )
 
                 # ensure normalization per subvolume
@@ -459,8 +498,7 @@ def _optimize_shifts_inner(
 
         return avg_score
 
-    n_iters = 1  # 5 iterations should give convergence
-    for x in range(n_iters):
+    for _ in range(n_steps):
         alignment_optimizer.step(closure)
 
     if setting == "global":

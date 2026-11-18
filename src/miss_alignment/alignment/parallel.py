@@ -15,6 +15,10 @@ def run_alignment_parallel(
     downsample: int,
     devices_list: list[int],
     n_cluster_workers: int | None = None,
+    oversampling: float | None = None,
+    optimizer: str | None = None,
+    optimizer_kwargs: dict | None = None,
+    position_subsample_fraction: float | None = None,
 ) -> dict[str, float]:
     """Distribute per-tilt-series alignment across local GPUs or a cluster.
 
@@ -22,6 +26,10 @@ def run_alignment_parallel(
     devices_list (local mode, unchanged behaviour). Set --n-cluster-workers N
     to submit N cluster jobs instead; requires MISS_CLUSTER_CONFIG and
     MISS_CLUSTER_SCRIPT to be set.
+
+    The optional performance knobs (oversampling, optimizer,
+    optimizer_kwargs, position_subsample_fraction) fall back to
+    evaluate_tilt_series defaults when None.
 
     Returns dict mapping tilt-series stem names to their final loss values.
     """
@@ -40,4 +48,8 @@ def run_alignment_parallel(
         devices=devices_list,
         n_cluster_workers=n_cluster_workers,
         queue_root=queue_root,
+        oversampling=oversampling,
+        optimizer=optimizer,
+        optimizer_kwargs=optimizer_kwargs,
+        position_subsample_fraction=position_subsample_fraction,
     )

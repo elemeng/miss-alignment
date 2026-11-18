@@ -49,3 +49,8 @@ tilt_series_alignment:
   patch_size: 96      # same as training patch size
   patch_overlap: 0.1  # tolerated overlap between patches used for optimizing the alignment
   batch_size: 32      # amount of patches simultaneously reconstructed in memory -> the more the merrier
+  # performance knobs for the alignment phase (defaults keep previous behavior):
+  oversampling: 2.0                 # reconstruction oversampling; 1.0 is ~4x faster but coarser
+  optimizer: lbfgs                  # alignment gradient optimizer: lbfgs (line search) or adam
+  optimizer_kwargs: null            # for adam: {n_steps: 40, lr: 5.0e-3}; null uses defaults
+  position_subsample_fraction: 1.0  # fraction of positions in early anchoring passes (anchoring only)

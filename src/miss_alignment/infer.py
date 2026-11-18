@@ -27,7 +27,16 @@ logger = logging.getLogger(__name__)
 
 # Used for any setting the config file leaves out (or when there is no config).
 DEFAULT_GENERAL_SETTINGS = {"apply_ctf": False, "seed": 45132}
-DEFAULT_ALIGNMENT_SETTINGS = {"patch_size": 96, "patch_overlap": 0.1, "batch_size": 32}
+DEFAULT_ALIGNMENT_SETTINGS = {
+    "patch_size": 96,
+    "patch_overlap": 0.1,
+    "batch_size": 32,
+    # alignment performance knobs (match evaluate_tilt_series defaults)
+    "oversampling": 2.0,
+    "optimizer": "lbfgs",
+    "optimizer_kwargs": None,
+    "position_subsample_fraction": 1.0,
+}
 
 
 def _normalize_setting(setting: dict) -> dict:
@@ -264,6 +273,13 @@ def infer_miss_align(
             downsample=iteration_setting["downsample"],
             devices_list=devices_alignment,
             n_cluster_workers=n_cluster_workers,
+            # optional performance knobs (None → evaluate_tilt_series defaults)
+            oversampling=alignment_config.get("oversampling"),
+            optimizer=alignment_config.get("optimizer"),
+            optimizer_kwargs=alignment_config.get("optimizer_kwargs"),
+            position_subsample_fraction=alignment_config.get(
+                "position_subsample_fraction"
+            ),
         )
 
         # make copies of the xml files after alignment

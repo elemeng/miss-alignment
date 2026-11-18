@@ -84,6 +84,9 @@ def optimize_shifts_spline(
     device: str | torch.device = "cpu",
     n_control_points: int = 7,
     max_retries: int = 3,
+    oversampling: float = 2.0,
+    optimizer: str = "lbfgs",
+    optimizer_kwargs: dict | None = None,
 ):
     """Optimize shifts using a smooth spline parameterization.
 
@@ -141,6 +144,9 @@ def optimize_shifts_spline(
                 apply_ctf=apply_ctf,
                 device=device,
                 n_control_points=n_control_points,
+                oversampling=oversampling,
+                optimizer=optimizer,
+                optimizer_kwargs=optimizer_kwargs,
             )
         except AlignmentNanError:
             retries_left -= 1
@@ -169,6 +175,9 @@ def _optimize_shifts_spline_inner(
     apply_ctf: bool,
     device: str | torch.device,
     n_control_points: int,
+    oversampling: float = 2.0,
+    optimizer: str = "lbfgs",
+    optimizer_kwargs: dict | None = None,
 ):
     """Inner spline optimization function that can raise AlignmentNanError.
 
@@ -177,6 +186,10 @@ def _optimize_shifts_spline_inner(
     tuple[TiltSeries, list[float]]
         Optimized tilt series and loss values.
     """
+    optimizer_kwargs = dict(optimizer_kwargs or {})
+    if optimizer not in ("lbfgs", "adam"):
+        raise ValueError(f"Unknown optimizer: {optimizer!r} (use 'lbfgs' or 'adam')")
+
     # Move to device
     tilt_series.to(device)
     model.to(device)
@@ -207,10 +220,18 @@ def _optimize_shifts_spline_inner(
 
     parameters = [control_deltas_x, control_deltas_y]
 
-    alignment_optimizer = torch.optim.LBFGS(
-        parameters,
-        line_search_fn="strong_wolfe",
-    )
+    if optimizer == "adam":
+        alignment_optimizer = torch.optim.Adam(
+            parameters,
+            lr=optimizer_kwargs.get("lr", 5e-3),
+        )
+        n_steps = int(optimizer_kwargs.get("n_steps", 40))
+    else:
+        alignment_optimizer = torch.optim.LBFGS(
+            parameters,
+            line_search_fn="strong_wolfe",
+        )
+        n_steps = 1  # strong_wolfe line search converges within one step
 
     loss_values = []
 
@@ -261,7 +282,7 @@ def _optimize_shifts_spline_inner(
                     pixel_size=pixel_size,
                     size=patch_size,
                     apply_ctf=apply_ctf,
-                    oversampling=2.0,
+                    oversampling=oversampling,
                 )
 
                 mean = einops.reduce(subvolumes, "n d h w -> n 1 1 1", reduction="mean")
@@ -304,8 +325,7 @@ def _optimize_shifts_spline_inner(
 
         return avg_score
 
-    n_iters = 1
-    for _ in range(n_iters):
+    for _ in range(n_steps):
         alignment_optimizer.step(closure)
 
     # Finalize: compute final shifts and detach
@@ -336,6 +356,9 @@ def optimize_shifts_coarse_to_fine(
     apply_ctf: bool = True,
     device: str | torch.device = "cpu",
     n_control_points: int = 7,
+    oversampling: float = 2.0,
+    optimizer: str = "lbfgs",
+    optimizer_kwargs: dict | None = None,
 ):
     """Two-phase optimization: smooth spline followed by per-tilt fine adjustment.
 
@@ -364,6 +387,12 @@ def optimize_shifts_coarse_to_fine(
         Device to run optimization on.
     n_control_points : int
         Number of spline control points for coarse phase.
+    oversampling : float, default 2.0
+        Reconstruction oversampling factor (both phases).
+    optimizer : str, default "lbfgs"
+        Gradient optimizer for the alignment parameters ("lbfgs" or "adam").
+    optimizer_kwargs : dict | None
+        Extra optimizer settings passed to both phases.
 
     Returns
     -------
@@ -385,6 +414,9 @@ def optimize_shifts_coarse_to_fine(
         apply_ctf=apply_ctf,
         device=device,
         n_control_points=n_control_points,
+        oversampling=oversampling,
+        optimizer=optimizer,
+        optimizer_kwargs=optimizer_kwargs,
     )
     all_loss_values.extend(loss_values)
     print(f"  Spline loss: {loss_values[0]:.4f} -> {loss_values[-1]:.4f}")
@@ -402,6 +434,9 @@ def optimize_shifts_coarse_to_fine(
         batch_size=batch_size,
         apply_ctf=apply_ctf,
         device=device,
+        oversampling=oversampling,
+        optimizer=optimizer,
+        optimizer_kwargs=optimizer_kwargs,
     )
     all_loss_values.extend(loss_values)
     print(f"  Per-tilt loss: {loss_values[0]:.4f} -> {loss_values[-1]:.4f}")
