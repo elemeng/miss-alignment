@@ -192,6 +192,11 @@ def optimize_shifts_iterative(
     apply_ctf: bool = True,
     device: str | torch.device = "cpu",
     initial_reliable_fraction: float = 1 / 2,
+    position_subsample_fraction: float = 1.0,
+    n_final_full_passes: int = 2,
+    oversampling: float = 2.0,
+    optimizer: str = "lbfgs",
+    optimizer_kwargs: dict | None = None,
 ) -> tuple[TiltSeries, list[float]]:
     """Iterative anchored optimization for global shifts.
 
@@ -220,29 +225,95 @@ def optimize_shifts_iterative(
         Device to run optimization on.
     initial_reliable_fraction : float
         Initial fraction of tilts to consider reliable (0 to 1). Default 1/2.
+    position_subsample_fraction : float, default 1.0
+        Fraction of reconstruction positions evaluated in the early (cheap)
+        anchoring passes; a fixed random subset is drawn once and reused so
+        loss values stay comparable across passes. The last
+        ``n_final_full_passes`` passes of the schedule and the final full
+        optimization always use all positions. 1.0 disables subsampling.
+    n_final_full_passes : int, default 2
+        Number of passes at the end of the anchoring schedule that use the
+        full position set (including the final all-tilts optimization).
+    oversampling : float, default 2.0
+        Reconstruction oversampling factor, passed through to
+        ``optimize_shifts``.
+    optimizer : str, default "lbfgs"
+        Gradient optimizer for the alignment parameters ("lbfgs" or "adam"),
+        passed through to ``optimize_shifts``.
+    optimizer_kwargs : dict | None
+        Extra optimizer settings, passed through to ``optimize_shifts``.
 
     Returns
     -------
     tuple[TiltSeries, list[float]]
         Optimized tilt series and loss values from all iterations.
     """
+    if not 0.0 < position_subsample_fraction <= 1.0:
+        raise ValueError(
+            "position_subsample_fraction must be in (0, 1], got "
+            f"{position_subsample_fraction}"
+        )
+    if n_final_full_passes < 0:
+        raise ValueError("n_final_full_passes must be >= 0")
+
+    # Keep model, tilt series, and images resident on device for the whole
+    # anchoring run: every pass would otherwise pay device transfers both
+    # ways. optimize_shifts skips its own transfers via device_override.
+    device = torch.device(device)
+    tilt_series.to(device)
+    model.to(device)
+
+    # Fixed random subset so early passes are comparable to each other (same
+    # positions → comparable loss values). Drawn once, reused every pass.
+    n_positions = positions.shape[0]
+    if position_subsample_fraction < 1.0:
+        n_subset = max(1, round(n_positions * position_subsample_fraction))
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(torch.initial_seed())
+        subset_indices = torch.randperm(n_positions, generator=generator)[:n_subset]
+        subset_positions = positions[subset_indices.to(positions.device)]
+    else:
+        n_subset = n_positions
+        subset_positions = positions
+
+    # Mirror run_iterative_anchoring's loop counter to know when the
+    # refinement tail begins: it runs one pass per decrement of
+    # n_unreliable_per_side plus one final all-tilts pass. The last
+    # n_final_full_passes of those use the full position set.
+    n_tilts = tilt_series.n_tilts
+    n_reliable = max(1, min(int(n_tilts * initial_reliable_fraction), n_tilts))
+    remaining = (n_tilts - n_reliable) // 2 + 1  # +1 for the final pass
 
     def optimize_fn(ts: TiltSeries) -> tuple[TiltSeries, list[float]]:
+        nonlocal remaining
+        use_full = n_subset >= n_positions or remaining <= n_final_full_passes
+        pass_positions = positions if use_full else subset_positions
+        remaining -= 1
+
         return optimize_shifts(
             model=model,
             tilt_series=ts,
             images=images,
             pixel_size=pixel_size,
-            positions=positions,
+            positions=pass_positions,
             setting="global",
             patch_size=patch_size,
             batch_size=batch_size,
             apply_ctf=apply_ctf,
             device=device,
+            oversampling=oversampling,
+            optimizer=optimizer,
+            optimizer_kwargs=optimizer_kwargs,
+            device_override=device,
         )
 
-    return run_iterative_anchoring(
-        tilt_series=tilt_series,
-        optimize_fn=optimize_fn,
-        initial_reliable_fraction=initial_reliable_fraction,
-    )
+    try:
+        return run_iterative_anchoring(
+            tilt_series=tilt_series,
+            optimize_fn=optimize_fn,
+            initial_reliable_fraction=initial_reliable_fraction,
+        )
+    finally:
+        # Caller of evaluate_tilt_series expects CPU-resident metadata.
+        tilt_series.to("cpu")
+        model.to("cpu")
