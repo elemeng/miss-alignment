@@ -39,7 +39,8 @@ def _spec(task_id="0000001-ts01"):
 
 def test_write_pending_creates_json(layout):
     write_pending(layout, _spec())
-    assert (layout.pending / "0000001-ts01.json").exists()
+    # Tasks are written into a shard subdirectory of pending/
+    assert len(list(layout.pending.glob("shard_*/*.json"))) == 1
 
 
 def test_claim_one_returns_spec_and_moves_file(layout):
@@ -47,7 +48,7 @@ def test_claim_one_returns_spec_and_moves_file(layout):
     result = claim_one(layout, "worker-0")
     assert result is not None
     assert result.task_id == "0000001-ts01"
-    assert not (layout.pending / "0000001-ts01.json").exists()
+    assert not list(layout.pending.glob("shard_*/*.json"))
     assert (layout.running / "worker-0" / "0000001-ts01.json").exists()
 
 
@@ -95,7 +96,9 @@ def test_clear_queue_recovers_orphans(layout):
     claim_one(layout, "worker-0")
     # simulate crash: running file remains; clear should put it back in pending
     clear_queue(layout)
-    assert (layout.pending / "0000001-ts01.json").exists()
+    recovered = list(layout.pending.glob("shard_*/*.json"))
+    assert len(recovered) == 1
+    assert recovered[0].name == "0000001-ts01.json"
 
 
 def test_clear_queue_wipes_done_and_failed(layout):
@@ -125,3 +128,46 @@ def test_compute_fingerprint_differs_on_change():
     fp1 = compute_fingerprint("/ckpt", "anchoring", 96, 0.1, 32, False, 2)
     fp2 = compute_fingerprint("/other.ckpt", "anchoring", 96, 0.1, 32, False, 2)
     assert fp1 != fp2
+
+
+class TestShardedPending:
+    """Pending tasks are spread over shards so a claim scan stays small."""
+
+    def test_tasks_spread_across_multiple_shards(self, layout):
+        from miss_alignment.distributed.queue import _PENDING_SHARDS
+
+        specs = [_spec(f"{i:07d}-ts{i:02d}") for i in range(64)]
+        for s in specs:
+            write_pending(layout, s)
+
+        shards = [d for d in layout.pending.glob("shard_*") if d.is_dir()]
+        assert len(shards) == _PENDING_SHARDS
+        used = [d for d in shards if any(d.glob("*.json"))]
+        # 64 ids over 16 shards: essentially all shards should be used
+        assert len(used) >= _PENDING_SHARDS // 2
+
+    def test_claim_drains_all_tasks(self, layout):
+        specs = [_spec(f"{i:07d}-ts{i:02d}") for i in range(20)]
+        for s in specs:
+            write_pending(layout, s)
+
+        claimed = []
+        while True:
+            spec = claim_one(layout, "worker-0")
+            if spec is None:
+                break
+            claimed.append(spec.task_id)
+
+        assert sorted(claimed) == sorted(s.task_id for s in specs)
+        assert not list(layout.pending.glob("shard_*/*.json"))
+
+    def test_claim_is_deterministic_per_task(self, layout):
+        """A task always lands in the same shard (needed for orphan recovery)."""
+        from miss_alignment.distributed.queue import _shard_for
+
+        spec = _spec("0000042-ts42")
+        shard = _shard_for(spec)
+        write_pending(layout, spec)
+        found = list(layout.pending.glob("shard_*/*.json"))
+        assert len(found) == 1
+        assert found[0].parent.name == f"shard_{shard:02d}"

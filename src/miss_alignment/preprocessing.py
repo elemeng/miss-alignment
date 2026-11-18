@@ -31,9 +31,12 @@ def _run_cross_correlation_single(
     else:
         device_str = "cuda"
 
-    # Load tilt-series data
+    # Load tilt-series data (stack lands on the target device, so tiltxcorr
+    # needs no further transfer)
     ts_data = TiltSeriesData(xml_metadata_path=xml_file)
-    ts, stack, pixel_size = ts_data.load_metadata_and_stack(downsample=1)
+    ts, stack, pixel_size = ts_data.load_metadata_and_stack(
+        downsample=1, device=device_str
+    )
 
     # Extract tilt axis angle from metadata (same for all tilts)
     tilt_axis_angle = ts.tilt_axis_angles[0].item()

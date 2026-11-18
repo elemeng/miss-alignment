@@ -3,6 +3,7 @@
 A fake worker thread simulates cluster workers by polling pending/ and
 writing done/ or failed/ files.
 """
+
 import json
 import os
 import threading
@@ -13,7 +14,7 @@ from unittest.mock import patch
 import pytest
 
 from miss_alignment.distributed.manager import run_distributed
-from miss_alignment.distributed.queue import QueueLayout
+from miss_alignment.distributed.queue import QueueLayout, write_pending
 
 
 def _make_xml(tmp_path, name):
@@ -30,7 +31,10 @@ def _fake_worker_thread(queue_root, n_tasks, fail=False):
         done_count = 0
         deadline = time.time() + 15
         while done_count < n_tasks and time.time() < deadline:
-            for f in list(layout.pending.glob("*.json")):
+            pending_files = list(layout.pending.glob("*.json")) + list(
+                layout.pending.glob("shard_*/*.json")
+            )
+            for f in pending_files:
                 data = json.loads(f.read_text())
                 task_id = data["task_id"]
                 running_dir = layout.running / "fake-worker"
@@ -46,9 +50,7 @@ def _fake_worker_thread(queue_root, n_tasks, fail=False):
                     )
                 else:
                     done_data = {**data, "final_loss": 0.01, "device": "cpu"}
-                    (layout.done / f"{task_id}.json").write_text(
-                        json.dumps(done_data)
-                    )
+                    (layout.done / f"{task_id}.json").write_text(json.dumps(done_data))
                 (running_dir / f"{task_id}.json").unlink(missing_ok=True)
                 done_count += 1
             time.sleep(0.05)
@@ -212,3 +214,112 @@ def test_run_distributed_prepare_stacks_task_type(tmp_path):
 
     assert losses is not None
     assert "ts01" in losses
+
+
+class TestKnobsInFingerprint:
+    """The alignment performance knobs must participate in the fingerprint.
+
+    Workers key their cached model state on init_fingerprint alone. If the
+    knobs are omitted, two tasks in one queue with different settings would
+    silently share cached state instead of reloading.
+    """
+
+    def _fp(self, **overrides):
+        from miss_alignment.distributed.queue import compute_fingerprint
+
+        kwargs = dict(
+            model_checkpoint_path="m.ckpt",
+            setting="anchoring",
+            patch_size=96,
+            patch_overlap=0.1,
+            batch_size=16,
+            apply_ctf=False,
+            downsample=1,
+        )
+        kwargs.update(overrides)
+        return compute_fingerprint(**kwargs)
+
+    def test_defaults_are_stable(self):
+        assert self._fp() == self._fp()
+
+    def test_oversampling_changes_fingerprint(self):
+        assert self._fp(oversampling=2.0) != self._fp(oversampling=1.0)
+
+    def test_optimizer_changes_fingerprint(self):
+        assert self._fp(optimizer="lbfgs") != self._fp(optimizer="adam")
+
+    def test_optimizer_kwargs_changes_fingerprint(self):
+        assert self._fp(optimizer="adam", optimizer_kwargs={"n_steps": 40}) != self._fp(
+            optimizer="adam", optimizer_kwargs={"n_steps": 80}
+        )
+
+    def test_position_subsample_changes_fingerprint(self):
+        assert self._fp(position_subsample_fraction=1.0) != self._fp(
+            position_subsample_fraction=0.25
+        )
+
+    def test_knobs_do_not_break_existing_fingerprint_fields(self):
+        base = self._fp()
+        assert base != self._fp(patch_size=64)
+        assert base != self._fp(downsample=2)
+
+
+class TestPersistentSession:
+    """The session keeps one pool warm across phases and tears it down once."""
+
+    def test_two_phases_share_one_pool(self, tmp_path, monkeypatch):
+        from miss_alignment.distributed import manager as mgr
+
+        spawned = []
+
+        class FakeProc:
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(cmd, **kwargs):
+            spawned.append(cmd)
+            return FakeProc()
+
+        monkeypatch.setattr(
+            "miss_alignment.distributed.provisioner.subprocess.Popen", fake_popen
+        )
+
+        queue_root = tmp_path / "tasks"
+        with mgr.PersistentSession(queue_root, devices=[0, 0]) as session:
+            assert len(spawned) == 2  # two slots
+            # Workers were asked to run persistently
+            assert all("--persistent" in cmd for cmd in spawned)
+
+            # Simulate two phases reusing the same pool
+            for _ in range(2):
+                session.ensure_running()
+                write_pending(session.layout, _speclike("phase"))
+
+            assert len(spawned) == 2  # no extra workers for phase 2
+
+        # Teardown removed the queue directory and wrote the stop marker first
+        assert not queue_root.exists()
+
+
+def _speclike(tag):
+    from miss_alignment.distributed.queue import TaskSpec
+
+    return TaskSpec(
+        task_id=f"{tag}-{id(tag)}",
+        model_checkpoint_path="/m.ckpt",
+        tilt_series_path="/t.xml",
+        output_directory="/out",
+        setting="anchoring",
+        patch_size=96,
+        patch_overlap=0.1,
+        batch_size=16,
+        apply_ctf=False,
+        downsample=1,
+        init_fingerprint="fp",
+    )

@@ -122,6 +122,7 @@ class MissAlignmentDataModule(pl.LightningDataModule):
         downsample: int = 1,
         pool_size: int = DEFAULT_POOL_SIZE,
         dataloader_workers: int = 2,
+        tilt_series_refresh_rate: int = 10,
     ):
         super().__init__()
 
@@ -158,6 +159,7 @@ class MissAlignmentDataModule(pl.LightningDataModule):
         self.apply_ctf = apply_ctf
         self.downsample = downsample
         self.shift_generator = shift_generator
+        self.tilt_series_refresh_rate = tilt_series_refresh_rate
 
         # initialize the dataset and pool attributes
         self.dataset_directory = Path(dataset_directory)
@@ -239,7 +241,7 @@ class MissAlignmentDataModule(pl.LightningDataModule):
                         "downsample": self.downsample,
                         "shift_generator": self.shift_generator,
                         "stop_event": self.stop_event,
-                        "tilt_series_refresh_rate": 10,
+                        "tilt_series_refresh_rate": self.tilt_series_refresh_rate,
                         "device": self.reconstruction_devices[worker_id],
                     },
                     # daemon so a hard crash of the parent (before teardown runs)

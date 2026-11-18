@@ -74,11 +74,21 @@ class WorkerProvisioner(ABC):
 
 
 class LocalProvisioner(WorkerProvisioner):
-    """Spawns one miss-alignment worker subprocess per GPU device."""
+    """Spawns one miss-alignment worker subprocess per device slot.
 
-    def __init__(self, queue_dir: Path, devices: list[int]) -> None:
+    ``devices`` may repeat a device index (e.g. ``[0, 0, 1, 1]``) to run
+    several workers on one GPU. Slots are tracked by position, not by device
+    index, so repeated devices are not collapsed into a single worker.
+    """
+
+    def __init__(
+        self, queue_dir: Path, devices: list[int], persistent: bool = False
+    ) -> None:
         self._queue_dir = queue_dir
         self._devices = devices
+        self._persistent = persistent
+        # Slot index -> process. Keyed by slot (not device) so repeated
+        # devices each get their own worker.
         self._procs: dict[int, subprocess.Popen] = {}
         self._lock = threading.Lock()
 
@@ -91,8 +101,8 @@ class LocalProvisioner(WorkerProvisioner):
 
     def ensure_workers(self, n_workers: int) -> None:
         with self._lock:
-            for device in self._devices:
-                proc = self._procs.get(device)
+            for slot, device in enumerate(self._devices):
+                proc = self._procs.get(slot)
                 if proc is not None and proc.poll() is None:
                     continue  # still running
                 new_proc = subprocess.Popen(
@@ -105,11 +115,12 @@ class LocalProvisioner(WorkerProvisioner):
                         str(self._queue_dir),
                         "--device",
                         str(device),
+                        *(["--persistent"] if self._persistent else []),
                     ],
                     stdout=subprocess.DEVNULL,
                     stderr=sys.stderr,
                 )
-                self._procs[device] = new_proc
+                self._procs[slot] = new_proc
 
     def shutdown(self) -> None:
         for proc in self._procs.values():
@@ -133,17 +144,17 @@ class LocalProvisioner(WorkerProvisioner):
 # Statuses where the job is actively executing on a node.
 _RUNNING_STATUSES: dict[str, set[str]] = {
     "slurm": {"RUNNING", "R", "COMPLETING", "CG", "RESIZING"},
-    "lsf":   {"RUN"},
-    "pbs":   {"R", "E"},
-    "sge":   {"r", "t", "Rr"},
+    "lsf": {"RUN"},
+    "pbs": {"R", "E"},
+    "sge": {"r", "t", "Rr"},
 }
 
 # Statuses where the job is alive but not yet on a node.
 _PENDING_STATUSES: dict[str, set[str]] = {
     "slurm": {"PENDING", "PD", "SUSPENDED", "S"},
-    "lsf":   {"PEND", "SSUSP", "USUSP", "PSUSP"},
-    "pbs":   {"Q", "H", "W", "T", "S"},
-    "sge":   {"qw", "Rq", "hqw", "hRwq"},
+    "lsf": {"PEND", "SSUSP", "USUSP", "PSUSP"},
+    "pbs": {"Q", "H", "W", "T", "S"},
+    "sge": {"qw", "Rq", "hqw", "hRwq"},
 }
 
 
@@ -338,9 +349,7 @@ class ClusterProvisioner(WorkerProvisioner):
         index = self._next_index
         self._next_index += 1
         script_path = self._render_script(index)
-        submit_cmd = self._config.submit.replace(
-            "{{script_path}}", str(script_path)
-        )
+        submit_cmd = self._config.submit.replace("{{script_path}}", str(script_path))
         result = subprocess.run(
             submit_cmd,
             shell=True,

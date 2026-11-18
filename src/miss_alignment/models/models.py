@@ -155,16 +155,18 @@ class MissAlignment(pl.LightningModule):
         img1, img2, img3, target = batch
         batch_size = target.shape[0]
 
-        # calculate scores and log_precisions for all three images
-        score1, log_prec1 = self(img1)
-        score2, log_prec2 = self(img2)
-        score3, log_prec3 = self(img3)
+        # Single forward over the concatenated triplet members (3B) instead
+        # of three separate passes: identical math, fewer kernel launches and
+        # better GPU utilization for this small model.
+        stacked_scores, stacked_log_precisions = self(
+            torch.cat((img1, img2, img3), dim=0)
+        )
 
-        # Stack into (batch, 3) format
-        scores = torch.stack((score1, score2, score3), dim=1)
-        scores = einops.rearrange(scores, "b d 1 -> b d")
-        log_precisions = torch.stack((log_prec1, log_prec2, log_prec3), dim=1)
-        log_precisions = einops.rearrange(log_precisions, "b d 1 -> b d")
+        # Unstack into (batch, 3) format; column k holds member k's output
+        scores = einops.rearrange(stacked_scores, "(k b) 1 -> b k", b=batch_size)
+        log_precisions = einops.rearrange(
+            stacked_log_precisions, "(k b) 1 -> b k", b=batch_size
+        )
 
         # Compute precision-weighted triplet loss
         loss, precision_reg = self.criterion(scores, log_precisions, target)
@@ -216,7 +218,7 @@ class MissAlignment(pl.LightningModule):
 
         self.log(
             name="train_loss",
-            value=total_loss.item(),
+            value=total_loss,
             prog_bar=True,
             on_step=False,
             on_epoch=True,
@@ -226,7 +228,7 @@ class MissAlignment(pl.LightningModule):
 
         self.log(
             name="triplet_loss",
-            value=triplet_loss.item(),
+            value=triplet_loss,
             prog_bar=False,
             on_step=False,
             on_epoch=True,
@@ -236,7 +238,7 @@ class MissAlignment(pl.LightningModule):
 
         self.log(
             name="precision_reg",
-            value=precision_reg.item(),
+            value=precision_reg,
             prog_bar=False,
             on_step=False,
             on_epoch=True,
@@ -247,7 +249,7 @@ class MissAlignment(pl.LightningModule):
         # log actual assigned score of the model
         self.log(
             name="train_score_aligned",
-            value=score_aligned.item(),
+            value=score_aligned,
             prog_bar=True,
             on_step=False,
             on_epoch=True,
@@ -256,7 +258,7 @@ class MissAlignment(pl.LightningModule):
         )
         self.log(
             name="train_score_misaligned",
-            value=score_misaligned.item(),
+            value=score_misaligned,
             prog_bar=True,
             on_step=False,
             on_epoch=True,
@@ -267,7 +269,7 @@ class MissAlignment(pl.LightningModule):
         # Log mean precision to monitor uncertainty learning
         self.log(
             name="mean_log_precision",
-            value=mean_log_precision.item(),
+            value=mean_log_precision,
             prog_bar=True,
             on_step=False,
             on_epoch=True,
@@ -279,7 +281,7 @@ class MissAlignment(pl.LightningModule):
         # approaching one-hot, letting a single triplet dominate the batch
         self.log(
             name="std_log_precision",
-            value=std_log_precision.item(),
+            value=std_log_precision,
             prog_bar=False,
             on_step=False,
             on_epoch=True,

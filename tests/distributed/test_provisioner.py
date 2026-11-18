@@ -30,6 +30,7 @@ def _cluster_cfg(tmp_path) -> ClusterConfig:
 # Status parser unit tests
 # ---------------------------------------------------------------------------
 
+
 def test_parse_status_output_slurm_running_and_pending():
     output = "12345,PENDING\n12346,RUNNING\n12347,COMPLETING\n"
     our_ids = {"12345", "12346", "12347", "99999"}
@@ -100,6 +101,7 @@ def test_parse_status_output_custom():
 # LocalProvisioner tests
 # ---------------------------------------------------------------------------
 
+
 def test_local_provisioner_spawns_one_process_per_device(tmp_path):
     with patch("miss_alignment.distributed.provisioner.subprocess.Popen") as mock_popen:
         mock_proc = MagicMock()
@@ -157,6 +159,7 @@ def test_local_provisioner_shutdown_terminates(tmp_path):
 # ClusterProvisioner tests
 # ---------------------------------------------------------------------------
 
+
 def test_cluster_provisioner_submits_n_workers_jobs(tmp_path):
     """ensure_workers submits until _job_submit_time reaches target."""
     cfg = _cluster_cfg(tmp_path)
@@ -166,8 +169,7 @@ def test_cluster_provisioner_submits_n_workers_jobs(tmp_path):
         call_num[0] += 1
         result = MagicMock()
         result.stdout = (
-            "" if "squeue" in cmd
-            else f"Submitted batch job {call_num[0]}\n"
+            "" if "squeue" in cmd else f"Submitted batch job {call_num[0]}\n"
         )
         return result
 
@@ -326,6 +328,7 @@ def test_cluster_provisioner_cancels_on_shutdown(tmp_path):
 # CompositeProvisioner tests
 # ---------------------------------------------------------------------------
 
+
 def test_composite_provisioner_delegates_to_all(tmp_path):
     a = MagicMock(spec=LocalProvisioner)
     b = MagicMock(spec=LocalProvisioner)
@@ -338,3 +341,63 @@ def test_composite_provisioner_delegates_to_all(tmp_path):
     p.shutdown()
     a.shutdown.assert_called_once()
     b.shutdown.assert_called_once()
+
+
+class TestRepeatedDevices:
+    """Repeated device indices must each get their own worker slot."""
+
+    def test_ensure_workers_spawns_one_per_slot(self, tmp_path, monkeypatch):
+        from miss_alignment.distributed.provisioner import LocalProvisioner
+
+        spawned = []
+
+        class FakeProc:
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(cmd, **kwargs):
+            spawned.append(cmd)
+            return FakeProc()
+
+        monkeypatch.setattr(
+            "miss_alignment.distributed.provisioner.subprocess.Popen", fake_popen
+        )
+
+        prov = LocalProvisioner(queue_dir=tmp_path, devices=[0, 0, 1])
+        prov.ensure_workers(3)
+
+        # All three slots spawned, even though device 0 repeats
+        assert len(spawned) == 3
+        devices = [cmd[cmd.index("--device") + 1] for cmd in spawned]
+        assert devices == ["0", "0", "1"]
+        assert prov.live_worker_count() == 3
+
+    def test_repeated_devices_not_collapsed_on_respawn(self, tmp_path, monkeypatch):
+        """A second ensure_workers must not spawn duplicates for live slots."""
+        from miss_alignment.distributed.provisioner import LocalProvisioner
+
+        spawned = []
+
+        class FakeProc:
+            def poll(self):
+                return None
+
+        def fake_popen(cmd, **kwargs):
+            spawned.append(cmd)
+            return FakeProc()
+
+        monkeypatch.setattr(
+            "miss_alignment.distributed.provisioner.subprocess.Popen", fake_popen
+        )
+
+        prov = LocalProvisioner(queue_dir=tmp_path, devices=[0, 0])
+        prov.ensure_workers(2)
+        prov.ensure_workers(2)  # all still alive -> no new spawns
+
+        assert len(spawned) == 2

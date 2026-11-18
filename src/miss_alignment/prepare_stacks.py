@@ -60,6 +60,53 @@ def _get_original_pixel_size(tilt_series: TiltSeries) -> float:
     return pixel_size
 
 
+def _stack_is_reusable(xml_path: Path, desired_pixel_size: float) -> bool:
+    """Check whether an already-prepared tilt stack can be reused.
+
+    A stack is reusable when the .st file, angle file, and thumbnail directory
+    all exist and the voxel size stored in the .st header matches the desired
+    pixel size. The pixel size is written by ``stack_tilts`` at preparation
+    time, so a header match guarantees the stack was prepared at exactly the
+    requested pixel size.
+
+    Parameters
+    ----------
+    xml_path : Path
+        Path to the tilt series XML metadata file.
+    desired_pixel_size : float
+        Desired pixel size in Angstroms for the output stack.
+
+    Returns
+    -------
+    bool
+        True when the existing stack matches the requested pixel size.
+    """
+    import mrcfile
+
+    ts = TiltSeries(str(xml_path))
+
+    stack_path = Path(ts.tilt_stack_path)
+    angle_file_path = Path(ts.angle_file_path)
+    thumbnail_dir = Path(ts.tilt_stack_thumbnail_dir)
+
+    if not stack_path.exists():
+        return False
+    if not angle_file_path.exists():
+        return False
+    if not thumbnail_dir.is_dir():
+        return False
+
+    try:
+        with mrcfile.open(
+            stack_path, mode="r", permissive=True, header_only=True
+        ) as mrc:
+            stored_pixel_size = float(mrc.voxel_size.x)
+    except (ValueError, OSError):
+        return False
+
+    return stored_pixel_size == desired_pixel_size
+
+
 def _prepare_single_tilt_series(
     xml_path: Path, desired_pixel_size: float, device: int | None
 ) -> None:
@@ -109,11 +156,14 @@ def prepare_stacks_parallel(
     desired_pixel_size: float,
     devices: list[int] | None = None,
     n_cluster_workers: int | None = None,
+    reuse_prepared_stacks: bool = False,
 ) -> None:
     """Prepare tilt stacks for all tilt series in the training directory.
 
     This function loads raw tilt images for each tilt series, rescales them
     to the desired pixel size, and creates aligned tilt stacks with thumbnails.
+    With ``reuse_prepared_stacks``, series whose existing stack already matches
+    the desired pixel size (checked via the .st MRC header) are skipped.
 
     Parameters
     ----------
@@ -127,6 +177,9 @@ def prepare_stacks_parallel(
     n_cluster_workers : int | None
         Number of cluster jobs to submit. When set, activates cluster mode;
         requires MISS_CLUSTER_CONFIG and MISS_CLUSTER_SCRIPT to be set.
+    reuse_prepared_stacks : bool, default False
+        Skip tilt series whose prepared stack already matches the desired
+        pixel size.
 
     Raises
     ------
@@ -141,9 +194,24 @@ def prepare_stacks_parallel(
             f"No XML files found in training directory: {training_directory}"
         )
 
+    if reuse_prepared_stacks:
+        reusable = [
+            xml for xml in xml_files if _stack_is_reusable(xml, desired_pixel_size)
+        ]
+        reusable_set = set(reusable)
+        xml_files = [xml for xml in xml_files if xml not in reusable_set]
+        if reusable:
+            print(
+                f"Reusing {len(reusable)} already-prepared stack(s) "
+                f"at {desired_pixel_size} Å"
+            )
+
+    if not xml_files:
+        print(f"All stacks already prepared at {desired_pixel_size} Å; nothing to do")
+        return
+
     print(
-        f"Preparing stacks for {len(xml_files)} tilt series "
-        f"at {desired_pixel_size} Å"
+        f"Preparing stacks for {len(xml_files)} tilt series at {desired_pixel_size} Å"
     )
 
     queue_root = training_directory / "tasks"

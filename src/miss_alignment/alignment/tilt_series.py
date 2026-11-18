@@ -204,7 +204,8 @@ def evaluate_tilt_series(
     # load tilt_series and set its name for output
     tilt_series_data = TiltSeriesData(xml_metadata_path=tilt_series_path)
     tilt_series, images, pixel_size = tilt_series_data.load_metadata_and_stack(
-        downsample=downsample
+        downsample=downsample,
+        device=device,  # run any Fourier rescale + preprocessing on the device
     )
     # run the preprocessing from warp for consistency
     images = preprocess_tilt_data(

@@ -23,12 +23,13 @@ class TiltSeriesData:
         return self.xml_metadata_path.stem
 
     def load_metadata_and_stack(
-        self, downsample=1, retry_on_read_error=False
+        self, downsample=1, retry_on_read_error=False, device=None
     ) -> tuple[TiltSeries, torch.Tensor, float]:
         metadata, images, pixel_size = _load_metadata_and_stack(
             self.xml_metadata_path,
             downsample=downsample,
             retry_on_read_error=retry_on_read_error,
+            device=device,
         )
         return metadata, images, pixel_size
 
@@ -117,10 +118,24 @@ def exclude_nonfinite_alignment_tilt_series(training_directory: Path) -> list[Pa
     return [xml_file for xml_file, _ in excluded]
 
 
+def _read_stack(stack_path: Path) -> tuple[torch.Tensor, float]:
+    """Read a tilt stack as a torch tensor without a second full copy.
+
+    mrcfile hands back the freshly-read data as a read-only numpy view of an
+    in-RAM buffer (not a disk memmap). Re-enabling writability is safe and
+    lets ``torch.from_numpy`` share the buffer instead of copying ~GBs again.
+    """
+    with mrcfile.open(stack_path) as mrc:
+        data = mrc.data
+        data.setflags(write=True)
+        return torch.from_numpy(data), float(mrc.voxel_size.x)
+
+
 def _load_metadata_and_stack(
     metadata_path: Path,
     downsample: int = 1,
     retry_on_read_error: bool = False,
+    device: str | torch.device | None = None,
 ) -> tuple[TiltSeries, torch.Tensor, float]:
     if not metadata_path.exists():
         raise FileNotFoundError(f"XML metadata file not found: {metadata_path}")
@@ -140,18 +155,20 @@ def _load_metadata_and_stack(
         _max_retries = 5
         for _attempt in range(_max_retries):
             try:
-                with mrcfile.open(stack_path) as mrc:
-                    images = torch.tensor(mrc.data)
-                    stack_pixel_size = float(mrc.voxel_size.x)
+                images, stack_pixel_size = _read_stack(stack_path)
                 break
             except ValueError as e:
                 if "read" not in str(e) or _attempt == _max_retries - 1:
                     raise
                 time.sleep(0.05 * (2**_attempt))
     else:
-        with mrcfile.open(stack_path) as mrc:
-            images = torch.tensor(mrc.data)
-            stack_pixel_size = float(mrc.voxel_size.x)
+        images, stack_pixel_size = _read_stack(stack_path)
+
+    # move to the target device before any rescaling so the (potentially
+    # large) Fourier rescale below runs on the GPU instead of single-threaded
+    # CPU FFT
+    if device is not None:
+        images = images.to(device)
 
     pixel_size = stack_pixel_size
     if downsample > 1:

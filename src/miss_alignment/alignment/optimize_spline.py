@@ -260,8 +260,11 @@ def _optimize_shifts_spline_inner(
 
         batches = int(math.ceil(positions.shape[0] / batch_size))
         total_samples = positions.shape[0]
-        total_weighted_score = 0.0
-        total_precision = 0.0
+        # Accumulate on the device in fp64 so no device sync is forced per
+        # batch; one sync at the end of the loop is enough. Detached reads so
+        # the accumulator never holds autograd state.
+        total_weighted_score = torch.zeros((), device=device, dtype=torch.float64)
+        total_precision = torch.zeros((), device=device, dtype=torch.float64)
 
         # Disable autocast to ensure full precision during optimization
         with torch.amp.autocast(device_type=device_type, enabled=False):
@@ -295,19 +298,23 @@ def _optimize_shifts_spline_inner(
                 batch_weighted_score = (batch_scores * batch_precisions).sum()
                 batch_precision_sum = batch_precisions.sum()
 
+                # Accumulate for precision-weighted average (detached reads so
+                # the accumulator holds no autograd state)
+                total_weighted_score += batch_weighted_score.detach().double()
+                total_precision += batch_precision_sum.detach().double()
+
                 # Weight by batch size for proper gradient accumulation
                 weighted_loss = batch_weighted_score * (
                     current_batch_size / total_samples
                 )
                 weighted_loss.backward()
 
-                # Accumulate for precision-weighted average
-                total_weighted_score += batch_weighted_score.item()
-                total_precision += batch_precision_sum.item()
-
-        # Precision-weighted average score
+        # Precision-weighted average score; .item() syncs once per closure
+        total_precision_value = total_precision.item()
         avg_score = (
-            total_weighted_score / total_precision if total_precision > 0 else 0.0
+            total_weighted_score.item() / total_precision_value
+            if total_precision_value > 0
+            else 0.0
         )
 
         # Check if loss is NaN and raise error

@@ -1,8 +1,10 @@
-import pytest
-import torch
 import pickle
 import time
+from pathlib import Path
 from unittest.mock import patch
+
+import pytest
+import torch
 
 from miss_alignment.data.training_dataset import ReconstructionPoolDataset
 
@@ -15,7 +17,15 @@ class TestReconstructionPoolDataset:
         """Create temporary directory for pool files."""
         pool_dir = tmp_path / "pool"
         pool_dir.mkdir()
+        # Partition files live in a per-partition subdirectory
+        (pool_dir / "partition_0").mkdir()
+        (pool_dir / "partition_1").mkdir()
         return pool_dir
+
+    def _write_triplet(self, pool_dir: Path, filename: str, sample_data) -> None:
+        """Write a triplet file into partition 0's subdirectory."""
+        with open(pool_dir / "partition_0" / filename, "wb") as f:
+            pickle.dump(sample_data, f)
 
     @pytest.fixture
     def sample_data(self):
@@ -70,28 +80,30 @@ class TestReconstructionPoolDataset:
 
         Files follow the naming:
         partition_{partition_id}_worker_{worker_id}_seq_{seq_id}.pickle
+        and live in the per-partition subdirectory.
         """
         # Create some test files from worker 0
         for i in range(3):
-            file_path = mock_pool_dir / f"partition_0_worker_0_seq_{i}.pickle"
-            with open(file_path, "wb") as f:
-                pickle.dump(sample_data, f)
+            self._write_triplet(
+                mock_pool_dir, f"partition_0_worker_0_seq_{i}.pickle", sample_data
+            )
 
         # Create some test files from worker 1 (same partition)
         for i in range(2):
-            file_path = mock_pool_dir / f"partition_0_worker_1_seq_{i}.pickle"
-            with open(file_path, "wb") as f:
-                pickle.dump(sample_data, f)
+            self._write_triplet(
+                mock_pool_dir, f"partition_0_worker_1_seq_{i}.pickle", sample_data
+            )
 
         # Create a file for different partition (should be ignored)
-        other_file = mock_pool_dir / "partition_1_worker_0_seq_0.pickle"
-        with open(other_file, "wb") as f:
+        with open(
+            mock_pool_dir / "partition_1" / "partition_1_worker_0_seq_0.pickle", "wb"
+        ) as f:
             pickle.dump(sample_data, f)
 
         # Create a temp file (should be filtered out)
-        tmp_file = mock_pool_dir / "tmp_partition_0_worker_0_xyz.pickle"
-        with open(tmp_file, "wb") as f:
-            pickle.dump(sample_data, f)
+        self._write_triplet(
+            mock_pool_dir, "tmp_partition_0_worker_0_xyz.pickle", sample_data
+        )
 
         files = dataset._list_partition_files()
         assert len(files) == 5  # 3 from worker 0 + 2 from worker 1
@@ -102,18 +114,22 @@ class TestReconstructionPoolDataset:
         """Test that __getitem__ reads file and deletes it after."""
         # Create enough files to meet batch_size threshold
         for i in range(5):
-            file_path = mock_pool_dir / f"partition_0_worker_0_seq_{i}.pickle"
-            with open(file_path, "wb") as f:
-                pickle.dump(sample_data, f)
+            self._write_triplet(
+                mock_pool_dir, f"partition_0_worker_0_seq_{i}.pickle", sample_data
+            )
 
-        initial_count = len(list(mock_pool_dir.glob("partition_0_*.pickle")))
+        initial_count = len(
+            list((mock_pool_dir / "partition_0").glob("partition_0_*.pickle"))
+        )
         assert initial_count == 5
 
         # Get an item
         result = dataset[0]
 
         # Check file was deleted
-        final_count = len(list(mock_pool_dir.glob("partition_0_*.pickle")))
+        final_count = len(
+            list((mock_pool_dir / "partition_0").glob("partition_0_*.pickle"))
+        )
         assert final_count == initial_count - 1
 
         # Check return format
@@ -124,9 +140,9 @@ class TestReconstructionPoolDataset:
         """Test that volumes are converted from fp16 to fp32."""
         # Create test files
         for i in range(5):
-            file_path = mock_pool_dir / f"partition_0_worker_0_seq_{i}.pickle"
-            with open(file_path, "wb") as f:
-                pickle.dump(sample_data, f)
+            self._write_triplet(
+                mock_pool_dir, f"partition_0_worker_0_seq_{i}.pickle", sample_data
+            )
 
         result = dataset[0]
 
@@ -138,9 +154,9 @@ class TestReconstructionPoolDataset:
         """Test that __getitem__ waits when not enough files available."""
         # Start with fewer files than batch_size
         for i in range(2):  # Less than batch_size=4
-            file_path = mock_pool_dir / f"partition_0_worker_0_seq_{i}.pickle"
-            with open(file_path, "wb") as f:
-                pickle.dump(sample_data, f)
+            self._write_triplet(
+                mock_pool_dir, f"partition_0_worker_0_seq_{i}.pickle", sample_data
+            )
 
         # Add more files in a separate thread after a delay
         import threading
@@ -148,9 +164,9 @@ class TestReconstructionPoolDataset:
         def add_files():
             time.sleep(0.1)  # Wait a bit
             for i in range(2, 5):  # Add more files
-                file_path = mock_pool_dir / f"partition_0_worker_0_seq_{i}.pickle"
-                with open(file_path, "wb") as f:
-                    pickle.dump(sample_data, f)
+                self._write_triplet(
+                    mock_pool_dir, f"partition_0_worker_0_seq_{i}.pickle", sample_data
+                )
 
         thread = threading.Thread(target=add_files)
         thread.start()
@@ -182,23 +198,22 @@ class TestReconstructionPoolDataset:
         result = dataset._normalize(volume)
         assert torch.all(torch.isfinite(result))
 
-    @patch("miss_alignment.data.training_dataset.random_contrast")
     @patch("miss_alignment.data.training_dataset.random_edge_mask")
     @patch("miss_alignment.data.training_dataset.random_cube_mask")
-    def test_prep_and_augment_no_mirror(
-        self, mock_cube, mock_edge, mock_contrast, dataset
-    ):
-        """Test augmentation pipeline does not include random_mirror."""
+    def test_prep_and_augment_no_mirror(self, mock_cube, mock_edge, dataset):
+        """Test augmentation pipeline does not include random_mirror.
+
+        Normalization and contrast jitter are fused into a single in-place
+        pass for speed, so there is no separate random_contrast call to mock;
+        the masks must still run once per volume.
+        """
         # Setup mocks to return input unchanged
-        mock_contrast.side_effect = lambda x: x
         mock_edge.side_effect = lambda x, **kwargs: x
         mock_cube.side_effect = lambda x: x
 
         volumes = [torch.randn(10, 10, 10) for _ in range(3)]
         _ = dataset._prep_and_augment(volumes)
 
-        # Check all augmentation functions were called
-        assert mock_contrast.call_count == 3
         assert mock_edge.call_count == 3
         assert mock_cube.call_count == 3
 
@@ -206,13 +221,44 @@ class TestReconstructionPoolDataset:
         for call in mock_edge.call_args_list:
             assert call[1]["edge_width"] == (1, 5)
 
+    def test_prep_and_augment_fused_normalize_contrast(self, dataset):
+        """Fused normalize+contrast equals the explicit two-step formulation.
+
+        Guards the optimisation: the in-place pass must reproduce
+        ``(v - mean) / std * std_change + mean_change`` exactly.
+        """
+        torch.manual_seed(3)
+        volumes = [torch.randn(10, 10, 10) for _ in range(3)]
+        originals = [v.clone() for v in volumes]
+
+        with (
+            patch("miss_alignment.data.training_dataset.random_edge_mask") as m1,
+            patch("miss_alignment.data.training_dataset.random_cube_mask") as m2,
+        ):
+            m1.side_effect = lambda x, **kw: x
+            m2.side_effect = lambda x: x
+            torch.manual_seed(11)
+            fused = dataset._prep_and_augment([v.clone() for v in volumes])
+
+        torch.manual_seed(11)
+        expected = []
+        for v in originals:
+            mean = torch.mean(v)
+            std = torch.std(v).clamp(min=1e-6)
+            a = torch.normal(1, 0.1, (1,), device=v.device)
+            b = torch.normal(0, 0.1, (1,), device=v.device)
+            expected.append((v - mean) / std * a + b)
+
+        for got, want in zip(fused, expected):
+            torch.testing.assert_close(got, want, atol=1e-6, rtol=1e-5)
+
     def test_channel_dimension_addition(self, dataset, mock_pool_dir, sample_data):
         """Test that channel dimension is added correctly."""
         # Create test files
         for i in range(5):
-            file_path = mock_pool_dir / f"partition_0_worker_0_seq_{i}.pickle"
-            with open(file_path, "wb") as f:
-                pickle.dump(sample_data, f)
+            self._write_triplet(
+                mock_pool_dir, f"partition_0_worker_0_seq_{i}.pickle", sample_data
+            )
 
         result = dataset[0]
 
@@ -227,9 +273,9 @@ class TestReconstructionPoolDataset:
         invalid_data = [(torch.randn(64, 64, 64).half(), 1) for _ in range(3)]
 
         for i in range(5):
-            file_path = mock_pool_dir / f"partition_0_worker_0_seq_{i}.pickle"
-            with open(file_path, "wb") as f:
-                pickle.dump(invalid_data, f)
+            self._write_triplet(
+                mock_pool_dir, f"partition_0_worker_0_seq_{i}.pickle", invalid_data
+            )
 
         with pytest.raises(
             ValueError,
@@ -240,15 +286,16 @@ class TestReconstructionPoolDataset:
     def test_corrupted_file_retry(self, dataset, mock_pool_dir, sample_data):
         """Test that corrupted files trigger retry."""
         # Create a corrupted file
-        corrupted_path = mock_pool_dir / "partition_0_worker_0_seq_0.pickle"
-        with open(corrupted_path, "wb") as f:
+        with open(
+            mock_pool_dir / "partition_0" / "partition_0_worker_0_seq_0.pickle", "wb"
+        ) as f:
             f.write(b"corrupted data")
 
         # Create valid files
         for i in range(1, 6):
-            file_path = mock_pool_dir / f"partition_0_worker_0_seq_{i}.pickle"
-            with open(file_path, "wb") as f:
-                pickle.dump(sample_data, f)
+            self._write_triplet(
+                mock_pool_dir, f"partition_0_worker_0_seq_{i}.pickle", sample_data
+            )
 
         # Should succeed by retrying with a different file
         result = dataset[0]
@@ -258,9 +305,9 @@ class TestReconstructionPoolDataset:
         """Test that FileNotFoundError (race condition) triggers retry."""
         # Create valid files
         for i in range(5):
-            file_path = mock_pool_dir / f"partition_0_worker_0_seq_{i}.pickle"
-            with open(file_path, "wb") as f:
-                pickle.dump(sample_data, f)
+            self._write_triplet(
+                mock_pool_dir, f"partition_0_worker_0_seq_{i}.pickle", sample_data
+            )
 
         call_count = 0
         original_open = open

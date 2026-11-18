@@ -1,16 +1,15 @@
+import contextlib
 import logging
 import os
 import socket
 import warnings
 from pathlib import Path
 from shutil import copyfile
-from typing import Optional
-import yaml
 
-import typer
 import torch
 import torch.multiprocessing as torch_mp
-
+import typer
+import yaml
 from lightning.pytorch import Trainer, seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
@@ -18,14 +17,15 @@ from lightning.pytorch.plugins.environments import LightningEnvironment
 from lightning.pytorch.strategies import DDPStrategy
 
 from ._cli import OPTION_PROMPT_KWARGS, cli
-from .utils import configure_logging, parse_device_list, sync_start_iteration_xmls
-from .data import MissAlignmentDataModule
+from .alignment import run_alignment_parallel
+from .data import DEFAULT_POOL_SIZE, MissAlignmentDataModule
 from .data.io import exclude_nonfinite_alignment_tilt_series
 from .data.shift_generation import create_default_generator
-from .models import MissAlignment, MAEarlyStopping, MAProgressBar
-from .alignment import run_alignment_parallel
+from .distributed.manager import PersistentSession
+from .models import MAEarlyStopping, MAProgressBar, MissAlignment
 from .prepare_stacks import prepare_stacks_parallel
 from .preprocessing import run_cross_correlation_alignment_parallel
+from .utils import configure_logging, parse_device_list, sync_start_iteration_xmls
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,25 @@ def _available_cpus() -> int:
     if hasattr(os, "sched_getaffinity"):
         return len(os.sched_getaffinity(0))
     return os.cpu_count() or 1
+
+
+def _resolve_pool_size(pool_size: int | None) -> int:
+    """Resolve the reconstruction pool size.
+
+    An explicit CLI value wins; otherwise the ``RECON_POOL_SIZE`` environment
+    variable is honored, falling back to the module default (1000).
+    """
+    if pool_size is not None:
+        return pool_size
+    env_value = os.environ.get("RECON_POOL_SIZE")
+    if env_value is not None:
+        resolved = int(env_value)
+        if resolved <= 0:
+            raise ValueError(
+                f"RECON_POOL_SIZE must be a positive integer, got {env_value!r}"
+            )
+        return resolved
+    return DEFAULT_POOL_SIZE
 
 
 def _find_free_port() -> int:
@@ -73,8 +92,8 @@ def _set_ddp_env(rank: int, world_size: int, master_port: int) -> None:
 def _resolve_start_checkpoint(
     start_iter: int,
     training_directory: Path,
-    config_checkpoint: Optional[str],
-) -> Optional[Path]:
+    config_checkpoint: str | None,
+) -> Path | None:
     """Pick the checkpoint to start the first training iteration from.
 
     iter 0 uses the config's ``model_checkpoint`` (or None for random weights).
@@ -111,7 +130,7 @@ def _training_worker(
     world_size: int,
     master_port: int,
     iteration: int,
-    model_checkpoint: Optional[Path],
+    model_checkpoint: Path | None,
     training_directory: Path,
     devices_training: list[int],
     devices_reconstruction: list[int],
@@ -285,33 +304,51 @@ def train_miss_align(
         "to run multiple workers per GPU (e.g., '0,0,1,1' runs 2 workers each "
         "on GPU 0 and GPU 1). Can overlap with training devices if needed.",
     ),
+    alignment_devices: str | None = typer.Option(
+        None,
+        help="Comma-separated list of GPU device indices for the alignment phase. "
+        "Each entry spawns one alignment worker. Devices can be repeated to run "
+        "multiple workers per GPU (e.g., '0,0' runs two workers on GPU 0), which "
+        "can help saturate one GPU when per-task work is memory-light. Defaults "
+        "to every visible GPU with one worker each.",
+    ),
     dataloaders_per_trainer: int = typer.Option(
         2,
         help="Number of CPU DataLoader workers per training device. "
         "Total DataLoader workers = this value × number of training devices.",
     ),
-    pool_size: int = typer.Option(
-        1000,
+    pool_size: int | None = typer.Option(
+        None,
         help="Maximum number of subtomgram reconstructions "
         "to write to temporary storage during training of the "
-        "misalignment model.",
+        "misalignment model. Defaults to the RECON_POOL_SIZE environment "
+        "variable, or 1000 if unset.",
     ),
     start_at_iteration: int = typer.Option(
         0,
         help="Continue from a specific iteration in the config.",
     ),
-    prepare_stacks: Optional[float] = typer.Option(
+    prepare_stacks: float | None = typer.Option(
         None,
         help="Pixel size (in Angstroms) for preprocessing tilt stacks. "
         "If provided, loads raw tilt images, rescales to this pixel size, "
         "and creates tilt stacks with thumbnails before training.",
     ),
+    reuse_prepared_stacks: bool = typer.Option(
+        False,
+        help="Reuse existing tilt stacks that already match the requested "
+        "pixel size (checked via the stack's MRC header) instead of "
+        "re-preparing them from raw movies. Only effective together with "
+        "--prepare-stacks.",
+    ),
     preprocess: bool = typer.Option(
         False,
         help="Run cross-correlation based alignment before training iterations. "
-        "This performs coarse alignment.",
+        "This performs coarse alignment. Note: it loads each full-resolution "
+        "tilt stack onto the GPU, so the device needs enough memory for the "
+        "largest stack.",
     ),
-    n_cluster_workers: Optional[int] = typer.Option(
+    n_cluster_workers: int | None = typer.Option(
         None,
         help="Number of cluster jobs to submit for the alignment phase. "
         "When set, activates cluster mode; requires MISS_CLUSTER_CONFIG "
@@ -356,9 +393,22 @@ def train_miss_align(
         str(max(1, _available_cpus() // len(devices_training))),
     )
 
-    # For alignment stage, use all visible GPUs
+    # For the alignment stage, default to every visible GPU with one worker
+    # each; --alignment-devices overrides this and may repeat devices to run
+    # several workers per GPU.
     n_visible_gpus = torch.cuda.device_count()
-    devices_alignment = list(range(n_visible_gpus))
+    if alignment_devices is not None:
+        devices_alignment = parse_device_list(alignment_devices)
+        if not devices_alignment:
+            raise ValueError("--alignment-devices must list at least one device index")
+        invalid = [d for d in devices_alignment if d >= n_visible_gpus]
+        if invalid:
+            raise ValueError(
+                f"--alignment-devices lists device(s) {invalid} but only "
+                f"{n_visible_gpus} visible GPU(s) exist"
+            )
+    else:
+        devices_alignment = list(range(n_visible_gpus))
 
     # Each macro-iteration runs two phases; report which devices each one uses.
     print("Macro-iteration phase 1 (model training):")
@@ -396,6 +446,7 @@ def train_miss_align(
             desired_pixel_size=prepare_stacks,
             devices=devices_alignment,
             n_cluster_workers=n_cluster_workers,
+            reuse_prepared_stacks=reuse_prepared_stacks,
         )
 
     # Run preprocessing if requested
@@ -436,94 +487,107 @@ def train_miss_align(
     # working alignments from that iteration's snapshot.
     sync_start_iteration_xmls(start_iter, training_directory)
 
-    for x in range(start_iter, end_iter):
-        # ============================================================
-        # ================= model training step ======================
-        # ============================================================
-        iteration_settings = general_config["iteration_settings"][x]
-        alignment_mode = iteration_settings["alignment"]
-        print(f"\n{'=' * 60}")
-        print(f"Iteration {x + 1}/{end_iter} - Alignment: {alignment_mode}")
-        print(f"{'=' * 60}\n")
+    # Resolve the reconstruction pool size once (CLI value > env var > default)
+    resolved_pool_size = _resolve_pool_size(pool_size)
 
-        # Run the training phase. Multi-GPU spawns one DDP worker per training
-        # device and joins; single-GPU runs in-process. Either way the main
-        # process is single-process again once this returns, with the best
-        # checkpoint published at training_directory / model.ckpt.
-        world_size = len(devices_training)
-        worker_args = (
-            world_size,
-            _find_free_port(),
-            x,
-            training_model_path,
-            training_directory,
-            devices_training,
-            devices_reconstruction,
-            general_config,
-            model_training_config,
-            data_module_config,
-            shift_generation_config,
-            iteration_settings,
-            dataloaders_per_trainer,
-            pool_size,
-        )
-        if world_size > 1:
-            torch_mp.spawn(
-                _training_worker, args=worker_args, nprocs=world_size, join=True
+    # One worker pool for every alignment phase of this run: workers stay
+    # warm (torch imported, CUDA contexts created, checkpoint cached) instead
+    # of being restarted per macro-iteration. Cluster mode keeps its own
+    # per-phase submission behaviour, so the session is local-only.
+    session_queue_root = training_directory / "tasks"
+    if n_cluster_workers is None:
+        session_context = PersistentSession(session_queue_root, devices_alignment)
+    else:
+        session_context = contextlib.nullcontext(None)
+
+    with session_context as alignment_session:
+        for x in range(start_iter, end_iter):
+            # ============================================================
+            # ================= model training step ======================
+            # ============================================================
+            iteration_settings = general_config["iteration_settings"][x]
+            alignment_mode = iteration_settings["alignment"]
+            print(f"\n{'=' * 60}")
+            print(f"Iteration {x + 1}/{end_iter} - Alignment: {alignment_mode}")
+            print(f"{'=' * 60}\n")
+
+            # Run the training phase. Multi-GPU spawns one DDP worker per training
+            # device and joins; single-GPU runs in-process. Either way the main
+            # process is single-process again once this returns, with the best
+            # checkpoint published at training_directory / model.ckpt.
+            world_size = len(devices_training)
+            worker_args = (
+                world_size,
+                _find_free_port(),
+                x,
+                training_model_path,
+                training_directory,
+                devices_training,
+                devices_reconstruction,
+                general_config,
+                model_training_config,
+                data_module_config,
+                shift_generation_config,
+                iteration_settings,
+                dataloaders_per_trainer,
+                resolved_pool_size,
             )
-        else:
-            _training_worker(0, *worker_args)
+            if world_size > 1:
+                torch_mp.spawn(
+                    _training_worker, args=worker_args, nprocs=world_size, join=True
+                )
+            else:
+                _training_worker(0, *worker_args)
 
-        # This known path was written by rank 0 and is used for alignment and
-        # as the starting checkpoint for the next iteration.
-        training_model_path = training_directory / "model.ckpt"
+            # This known path was written by rank 0 and is used for alignment and
+            # as the starting checkpoint for the next iteration.
+            training_model_path = training_directory / "model.ckpt"
 
-        # ============================================================
-        # =============== tilt-series alignment step =================
-        # ============================================================
+            # ============================================================
+            # =============== tilt-series alignment step =================
+            # ============================================================
 
-        # get list of all files to process for alignment
-        tilt_series_list = list(training_directory.glob("*.xml"))
+            # get list of all files to process for alignment
+            tilt_series_list = list(training_directory.glob("*.xml"))
 
-        # run alignment in parallel over all available devices
-        run_alignment_parallel(
-            model_checkpoint=str(training_model_path),
-            tilt_series_list=tilt_series_list,
-            output_directory=training_directory,
-            setting=iteration_settings["alignment"],
-            patch_size=alignment_config["patch_size"],
-            patch_overlap=alignment_config["patch_overlap"],
-            batch_size=alignment_config["batch_size"],
-            apply_ctf=general_config["apply_ctf"],
-            downsample=iteration_settings["downsample"],
-            devices_list=devices_alignment,
-            n_cluster_workers=n_cluster_workers,
-            # optional performance knobs (None → evaluate_tilt_series defaults)
-            oversampling=alignment_config.get("oversampling"),
-            optimizer=alignment_config.get("optimizer"),
-            optimizer_kwargs=alignment_config.get("optimizer_kwargs"),
-            position_subsample_fraction=alignment_config.get(
-                "position_subsample_fraction"
-            ),
-        )
+            # run alignment in parallel over all available devices
+            run_alignment_parallel(
+                model_checkpoint=str(training_model_path),
+                tilt_series_list=tilt_series_list,
+                output_directory=training_directory,
+                setting=iteration_settings["alignment"],
+                patch_size=alignment_config["patch_size"],
+                patch_overlap=alignment_config["patch_overlap"],
+                batch_size=alignment_config["batch_size"],
+                apply_ctf=general_config["apply_ctf"],
+                downsample=iteration_settings["downsample"],
+                devices_list=devices_alignment,
+                n_cluster_workers=n_cluster_workers,
+                # optional performance knobs (None → evaluate_tilt_series defaults)
+                oversampling=alignment_config.get("oversampling"),
+                optimizer=alignment_config.get("optimizer"),
+                optimizer_kwargs=alignment_config.get("optimizer_kwargs"),
+                position_subsample_fraction=alignment_config.get(
+                    "position_subsample_fraction"
+                ),
+                session=alignment_session,
+            )
 
-        # make copies of the xml files and model after alignment
-        iteration_directory = training_directory / ("iter" + str(x + 1))
-        iteration_directory.mkdir(parents=True, exist_ok=True)
+            # make copies of the xml files and model after alignment
+            iteration_directory = training_directory / ("iter" + str(x + 1))
+            iteration_directory.mkdir(parents=True, exist_ok=True)
 
-        for xml_file in training_directory.glob("*.xml"):
-            destination_xml = iteration_directory / xml_file.name
-            copyfile(xml_file, destination_xml)
+            for xml_file in training_directory.glob("*.xml"):
+                destination_xml = iteration_directory / xml_file.name
+                copyfile(xml_file, destination_xml)
 
-            # copy the file with the alignment loss
-            loss_json = xml_file.stem + "_alignment_loss.json"
-            destination_json = iteration_directory / loss_json
-            copyfile(training_directory / loss_json, destination_json)
+                # copy the file with the alignment loss
+                loss_json = xml_file.stem + "_alignment_loss.json"
+                destination_json = iteration_directory / loss_json
+                copyfile(training_directory / loss_json, destination_json)
 
-        iteration_model_path = iteration_directory / "model.ckpt"
-        copyfile(training_model_path, iteration_model_path)
+            iteration_model_path = iteration_directory / "model.ckpt"
+            copyfile(training_model_path, iteration_model_path)
 
-        # training_model_path now points at the model just trained
-        # (set after the worker above); the next iteration starts from it.
-
-    return None
+            # training_model_path now points at the model just trained
+            # (set after the worker above); the next iteration starts from it.

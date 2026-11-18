@@ -64,6 +64,15 @@ def optimize_shifts(
     batch_size : int
         Batch size for reconstruction.
     apply_ctf : bool
+        Whether CTF correction is applied during reconstruction.
+    device : str | torch.device
+        Device to run optimization on.
+    max_retries : int
+        Maximum number of retry attempts if NaN is encountered.
+    device_override : str | torch.device | None, default None
+        When set by a multi-pass caller (e.g. iterative anchoring) that keeps
+        model and tilt series resident on this device across passes, skips the
+        device transfers in both directions; the caller owns moving data back.
         Whether to apply CTF correction.
     device : str
         Device to run optimization on.
@@ -415,8 +424,11 @@ def _optimize_shifts_inner(
 
         batches = int(math.ceil(positions.shape[0] / batch_size))
         total_samples = positions.shape[0]
-        total_weighted_score = 0.0
-        total_precision = 0.0
+        # Accumulate on the device in fp64 (matching the previous Python-float
+        # accumulation) so no device sync is forced per batch; one sync at the
+        # end of the loop is enough.
+        total_weighted_score = torch.zeros((), device=device, dtype=torch.float64)
+        total_precision = torch.zeros((), device=device, dtype=torch.float64)
 
         # Disable autocast to ensure full precision during optimization
         with torch.amp.autocast(device_type=device_type, enabled=False):
@@ -456,6 +468,11 @@ def _optimize_shifts_inner(
                 batch_weighted_score = (batch_scores * batch_precisions).sum()
                 batch_precision_sum = batch_precisions.sum()
 
+                # Accumulate for precision-weighted average (before backward
+                # so no graph state is involved in the read)
+                total_weighted_score += batch_weighted_score.detach().double()
+                total_precision += batch_precision_sum.detach().double()
+
                 # Weight by batch size for proper gradient accumulation
                 weighted_loss = batch_weighted_score * (
                     current_batch_size / total_samples
@@ -464,17 +481,14 @@ def _optimize_shifts_inner(
                 # Backward pass for this batch (gradients accumulate)
                 weighted_loss.backward()
 
-                # Accumulate for precision-weighted average
-                total_weighted_score += batch_weighted_score.item()
-                total_precision += batch_precision_sum.item()
-
-        # Precision-weighted average score
-        if total_precision <= 0:
+        # Precision-weighted average score; .item() syncs once per closure
+        total_precision_value = total_precision.item()
+        if total_precision_value <= 0:
             raise ValueError(
-                f"Total precision is {total_precision}, which is <= 0. "
+                f"Total precision is {total_precision_value}, which is <= 0. "
                 "This indicates a problem with the model precision outputs."
             )
-        avg_score = total_weighted_score / total_precision
+        avg_score = (total_weighted_score / total_precision).item()
 
         # Check if loss is NaN and raise error
         if math.isnan(avg_score):

@@ -86,7 +86,9 @@ def infer_miss_align(
     preprocess: bool = typer.Option(
         False,
         help="Run cross-correlation based alignment before the inference "
-        "iterations. This performs coarse alignment.",
+        "iterations. This performs coarse alignment. Note: it loads each "
+        "full-resolution tilt stack onto the GPU, so the device needs enough "
+        "memory for the largest stack.",
     ),
     n_cluster_workers: Optional[int] = typer.Option(
         None,

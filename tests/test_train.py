@@ -21,10 +21,32 @@ from lightning.pytorch.strategies import DDPStrategy
 
 from miss_alignment.train import (
     _find_free_port,
+    _resolve_pool_size,
     _resolve_start_checkpoint,
     _set_ddp_env,
 )
 from miss_alignment.utils import is_rank_zero, sync_start_iteration_xmls
+
+
+def test_resolve_pool_size_explicit_value_wins(monkeypatch):
+    monkeypatch.setenv("RECON_POOL_SIZE", "500")
+    assert _resolve_pool_size(2000) == 2000
+
+
+def test_resolve_pool_size_env_fallback(monkeypatch):
+    monkeypatch.setenv("RECON_POOL_SIZE", "750")
+    assert _resolve_pool_size(None) == 750
+
+
+def test_resolve_pool_size_default_without_env(monkeypatch):
+    monkeypatch.delenv("RECON_POOL_SIZE", raising=False)
+    assert _resolve_pool_size(None) == 1000
+
+
+def test_resolve_pool_size_rejects_non_positive_env(monkeypatch):
+    monkeypatch.setenv("RECON_POOL_SIZE", "0")
+    with pytest.raises(ValueError, match="RECON_POOL_SIZE"):
+        _resolve_pool_size(None)
 
 
 class _TinyDataset(Dataset):
